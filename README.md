@@ -53,13 +53,20 @@
 3. **Ваш числовой Телеграм-ID** — чтобы бот слушался только вас.
 4. Аккаунт на github.com и сервер FirstVDS с Ubuntu.
 
-### Шаг 1. Создать бота у @BotFather
+### Шаг 1. Получить токен телеграм-бота
 
-1. Откройте в Телеграме @BotFather → команда `/newbot`.
-2. Придумайте имя (например, «Эрнест Билеты») и логин бота
-   (должен оканчиваться на `bot`, например `ErnestTicketsNewBot`).
-3. BotFather пришлёт **токен** — длинную строку вида `1234567890:AA...`.
-   Сохраните её, никому не показывайте.
+**Если бот ещё не создан:** откройте в Телеграме @BotFather → команда
+`/newbot` → придумайте имя (например «PROCESS Билеты») и логин, который
+оканчивается на `bot`. BotFather пришлёт **токен** — длинную строку вида
+`1234567890:AA...`.
+
+**Если бот уже создан, а токен нужно выпустить заново** (например, старый
+где-то засветился): @BotFather → `/mybots` → выберите своего бота →
+**API Token** → **Revoke current token**. BotFather выдаст новый токен, а
+старый сразу перестанет работать.
+
+Токен — это пароль от бота. Сохраните его в надёжном месте и никому не
+показывайте.
 
 Если бот уже создан, а токен потерян или отозван, новый берётся так:
 @BotFather → `/mybots` → выберите бота → **API Token**. Там же есть кнопка
@@ -87,59 +94,47 @@
 
 ---
 
-## Шаг 4. Положить код на GitHub (с Мака, в Терминале)
+## Шаг 4. Положить код на GitHub (приложение GitHub на Маке)
 
 Так код будет лежать в одном месте, а обновлять бота на сервере можно
-будет одной командой.
+будет одной командой. Ничего программировать не нужно — только несколько
+нажатий в приложении.
 
-**4.1. Проверьте, что на Маке есть git.** Откройте Терминал
-(Программы → Утилиты → Терминал) и введите:
+**4.1. Распакуйте архив.** Двойной клик по `process-tickets-bot.zip` —
+рядом появится папка `PROCESS-Tickets-bot`. Оставьте её там, где она есть
+(обычно это «Загрузки»).
 
-    git --version
+**4.2. Добавьте папку в приложение.** В GitHub Desktop: меню
+**File → Add Local Repository → Choose…** и выберите папку `PROCESS-Tickets-bot`.
 
-Если git не установлен, Мак сам предложит установить «Инструменты командной
-строки» — согласитесь и дождитесь конца установки, потом повторите команду.
+Приложение предупредит, что папка пока не является репозиторием. Это
+нормально и так и должно быть: нажмите в тексте предупреждения ссылку
+**create a repository**.
 
-**4.2. Создайте пустой репозиторий на GitHub.** На github.com нажмите
-**+ → New repository**. Имя: `ernest-bot`. Тип — **Public** (в коде нет
-никаких ключей, а с публичным репозиторием сервер скачает код без пароля;
-если хотите Private, см. примечание в конце этого шага). Галочки «Add a
-README», «Add .gitignore», «Choose a license» — **не ставьте**, репозиторий
-должен быть пустым. Нажмите **Create repository**.
+**4.3. Создайте репозиторий.** В открывшемся окне:
 
-**4.3. Отправьте код.** Распакуйте архив `ernest-tickets-bot.zip` (двойной
-клик), затем в Терминале выполните по очереди — путь подставьте свой, если
-папка не в «Загрузках»:
+* **Name** — `PROCESS-Tickets-bot`
+* **Initialize this repository with a README** — галочку **не ставить**
+  (файл README уже лежит в папке)
+* **Git Ignore** — оставить **None** (файл `.gitignore` тоже уже есть,
+  именно он не пустит ключи на GitHub)
+* нажмите **Create repository**
 
-    cd ~/Downloads/ernest-bot
-    git init
-    git add .
-    git status
+**4.4. Опубликуйте.** В верхней панели нажмите **Publish repository**.
+В открывшемся окне **снимите галочку «Keep this code private»** — тогда
+сервер скачает код без всяких паролей. Секретов в коде нет: ключи живут
+только в файле `.env`, который создаётся уже на сервере и на GitHub не
+попадает. Нажмите **Publish repository**.
 
-Команда `git status` покажет список файлов, которые уйдут на GitHub.
-**Убедитесь, что в нём нет `.env` и `data.db`** — они исключены заранее
-файлом `.gitignore`. Дальше:
+Запомните адрес репозитория — он понадобится на следующем шаге:
+`https://github.com/ВАШ_ЛОГИН/PROCESS-Tickets-bot`
 
-    git commit -m "Первая версия бота"
-    git branch -M main
-    git remote add origin https://github.com/ВАШ_ЛОГИН/ernest-bot.git
-    git push -u origin main
-
-В последней команде git спросит логин и пароль. **Вместо пароля нужен
-токен GitHub** (обычный пароль от аккаунта не подойдёт). Как его получить:
-на github.com откройте **Settings → Developer settings → Personal access
-tokens → Tokens (classic) → Generate new token (classic)**, задайте имя и
-срок действия, отметьте область **repo** и нажмите **Generate token**.
-Токен показывается один раз — сразу скопируйте его и вставьте в Терминал
-как пароль. Терминал при вводе пароля ничего не показывает — это нормально,
-просто вставьте и нажмите Enter. Мак сохранит токен в Связке ключей, так
-что второй раз спрашивать не будет.
-
-Обновите страницу репозитория на GitHub — файлы должны появиться.
-
-*Примечание про Private.* Если репозиторий приватный, на сервере при
-`git clone` тоже спросят логин и токен — введите те же. Всё остальное
-одинаково.
+*Если удобнее Терминал.* Тот же результат дают команды в папке с кодом:
+`git init`, `git add .`, `git commit -m "Первая версия"`, `git branch -M main`,
+`git remote add origin https://github.com/ВАШ_ЛОГИН/PROCESS-Tickets-bot.git`,
+`git push -u origin main`. При отправке git попросит логин и вместо пароля —
+токен GitHub (**Settings → Developer settings → Personal access tokens →
+Tokens (classic)**, область `repo`).
 
 ---
 
@@ -155,8 +150,8 @@ tokens → Tokens (classic) → Generate new token (classic)**, задайте �
     apt update
     apt install -y python3 python3-venv git
 
-    git clone https://github.com/ВАШ_ЛОГИН/ernest-bot.git /opt/ernest-bot
-    cd /opt/ernest-bot
+    git clone https://github.com/ВАШ_ЛОГИН/PROCESS-Tickets-bot.git /opt/PROCESS-Tickets-bot
+    cd /opt/PROCESS-Tickets-bot
 
     python3 -m venv venv
     venv/bin/pip install -r requirements.txt
@@ -187,19 +182,19 @@ tokens → Tokens (classic) → Generate new token (classic)**, задайте �
 Чтобы бот стартовал сам после перезагрузки сервера и поднимался после
 сбоев, подключим его к системному диспетчеру служб (systemd):
 
-    cp /opt/ernest-bot/ernest-bot.service /etc/systemd/system/
+    cp /opt/PROCESS-Tickets-bot/process-tickets-bot.service /etc/systemd/system/
     systemctl daemon-reload
-    systemctl enable --now ernest-bot
+    systemctl enable --now process-tickets-bot
 
 Проверка состояния и «живой» журнал работы:
 
-    systemctl status ernest-bot
-    journalctl -u ernest-bot -f        # выход — Ctrl+C
+    systemctl status process-tickets-bot
+    journalctl -u process-tickets-bot -f        # выход — Ctrl+C
 
 Полезное на будущее:
 
-    systemctl restart ernest-bot       # перезапустить
-    systemctl stop ernest-bot          # остановить
+    systemctl restart process-tickets-bot       # перезапустить
+    systemctl stop process-tickets-bot          # остановить
 
 ---
 
@@ -226,7 +221,7 @@ tokens → Tokens (classic) → Generate new token (classic)**, задайте �
   в `OWNER_IDS`. Если бота добавит кто-то другой, бот напишет, что он
   личный, и сам выйдет из чата. Это защита от добавления в чужие чаты.
   Если добавлять будет сотрудник — сначала впишите его ID в `OWNER_IDS`
-  на сервере (`nano .env`, затем `systemctl restart ernest-bot`).
+  на сервере (`nano .env`, затем `systemctl restart process-tickets-bot`).
 * **Если в чате запрещено писать обычным участникам** (в настройках группы
   «Разрешения → Отправка сообщений» выключена — так делают в чатах-объявлениях),
   бот писать не сможет. Тогда сделайте его администратором: откройте
@@ -298,35 +293,55 @@ tokens → Tokens (classic) → Generate new token (classic)**, задайте �
 
 ---
 
+## Про имена: что с чем связано
+
+Имя проекта нигде не «зашито» в код — переименовать можно спокойно.
+Значение имеют только три места, и они не обязаны совпадать:
+
+* **Имя репозитория на GitHub** (`PROCESS-Tickets-bot`) — просто название
+  страницы. Влияет лишь на адрес для `git clone`.
+* **Имя папки на сервере** (`/opt/PROCESS-Tickets-bot`) — набирайте его
+  ровно с такими же заглавными буквами: в Линуксе `PROCESS` и `process` —
+  разные папки. Чтобы не ошибаться, наберите `cd /opt/PRO` и нажмите Tab —
+  Терминал допишет остальное сам. Это имя — то, что вы
+  набираете в командах. Записано в файле `process-tickets-bot.service`
+  в двух строках: `WorkingDirectory` и `ExecStart`. Меняете папку —
+  поменяйте и их.
+* **Имя службы** — это имя файла `.service` в `/etc/systemd/system/`.
+  Именно оно подставляется в `systemctl` и `journalctl`.
+
+В самих файлах с кодом (`main.py`, `db.py` и остальных) имени проекта нет,
+поэтому переименование их не затрагивает. Логин бота в Телеграме к имени
+папки тоже никак не привязан.
+
+---
+
 ## Обновление и резервная копия
 
-**Обновление кода.** Правки удобно вносить на Маке и отправлять на GitHub:
+**Обновление кода.** Правки вносятся на Маке и отправляются на GitHub —
+в приложении GitHub это два нажатия: слева внизу впишите короткое описание
+правки и нажмите **Commit to main**, затем вверху — **Push origin**.
 
-    cd ~/Downloads/ernest-bot
-    git add .
-    git commit -m "Что изменилось"
-    git push
+А на сервере забрать обновление:
 
-А на сервере забрать их:
-
-    cd /opt/ernest-bot
+    cd /opt/PROCESS-Tickets-bot
     git pull
-    systemctl restart ernest-bot
+    systemctl restart process-tickets-bot
 
 Файлы `.env` и `data.db` при этом не трогаются — настройки сохраняются.
 
-**Резервная копия** — это один файл `/opt/ernest-bot/data.db` (все чаты,
+**Резервная копия** — это один файл `/opt/PROCESS-Tickets-bot/data.db` (все чаты,
 мероприятия и расписания). Скачать его на Мак можно так (команда
 выполняется на **Маке**, не на сервере):
 
-    scp root@ВАШ_IP_СЕРВЕРА:/opt/ernest-bot/data.db ~/Desktop/
+    scp root@ВАШ_IP_СЕРВЕРА:/opt/PROCESS-Tickets-bot/data.db ~/Desktop/
 
 ## Частые вопросы
 
 **Бот молчит, хотя расписание задано.** Проверьте по порядку: включены ли
 уведомления в меню чата; тот ли день недели отмечен; тот ли часовой пояс
 выбран (время считается по поясу чата, а не сервера); работает ли служба
-(`systemctl status ernest-bot`). Журнал ошибок: `journalctl -u ernest-bot -e`.
+(`systemctl status process-tickets-bot`). Журнал ошибок: `journalctl -u process-tickets-bot -e`.
 
 **Сервер был выключен в момент отправки.** Пропущенные уведомления задним
 числом не досылаются — нажмите «Отчёт за сегодня».
