@@ -5,6 +5,8 @@
 ни сертификаты — достаточно доступа в интернет.
 """
 
+from __future__ import annotations  # чтобы код работал и на Python 3.9
+
 import asyncio
 import logging
 import sys
@@ -61,8 +63,13 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    if sys.version_info < (3, 10):
-        print("Нужен Python 3.10 или новее.", file=sys.stderr)
+    if sys.version_info < (3, 9):
+        print(
+            "Нужен Python 3.9 или новее. Сейчас: "
+            f"{sys.version_info.major}.{sys.version_info.minor}.\n"
+            "На Ubuntu 20.04 поставить: apt install -y python3.9 python3.9-venv",
+            file=sys.stderr,
+        )
         raise SystemExit(1)
     try:
         asyncio.run(main())

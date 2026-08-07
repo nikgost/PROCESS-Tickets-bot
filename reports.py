@@ -1,5 +1,7 @@
 """Сборка текста отчётов «На сегодня куплено билетов…» и формат расписаний."""
 
+from __future__ import annotations  # чтобы код работал и на Python 3.9
+
 import html
 import logging
 from datetime import datetime

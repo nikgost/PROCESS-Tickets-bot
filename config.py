@@ -1,5 +1,7 @@
 """Настройки бота. Значения берутся из файла .env, лежащего рядом с кодом."""
 
+from __future__ import annotations  # чтобы код работал и на Python 3.9
+
 import os
 
 from dotenv import load_dotenv

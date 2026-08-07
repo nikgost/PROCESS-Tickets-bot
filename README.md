@@ -363,6 +363,19 @@ Tokens (classic)**, область `repo`).
 **Ошибка про часовые пояса (ZoneInfo/tzdata) при запуске.** Выполните
 `apt install -y tzdata` и перезапустите бота.
 
+**Ошибка `TypeError: 'type' object is not subscriptable` при запуске.**
+На сервере слишком старый Python — нужен 3.9 или новее. Проверить:
+`python3 --version`. На Ubuntu 20.04 (там по умолчанию 3.8) нужный Python
+есть в родных репозиториях системы:
+
+    apt install -y python3.9 python3.9-venv
+    cd /opt/PROCESS-Tickets-bot
+    rm -rf venv
+    python3.9 -m venv venv
+    venv/bin/pip install -r requirements.txt
+
+Файл `.env` с ключами при этом не трогается — вводить их заново не нужно.
+
 **`git push` ругается на права доступа.** Скорее всего вместо токена введён
 пароль от аккаунта. Создайте токен (шаг 4.3) и повторите; если Мак
 запомнил неверный пароль, удалите запись «github.com» в программе

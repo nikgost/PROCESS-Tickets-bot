@@ -25,6 +25,8 @@
   fc / fs                 — «в главное меню» / «остаться и доделать»
 """
 
+from __future__ import annotations  # чтобы код работал и на Python 3.9
+
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import config

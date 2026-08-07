@@ -10,6 +10,8 @@
 вдруг проигнорирует фильтр, подсчёт всё равно останется верным.
 """
 
+from __future__ import annotations  # чтобы код работал и на Python 3.9
+
 import asyncio
 import logging
 from datetime import datetime

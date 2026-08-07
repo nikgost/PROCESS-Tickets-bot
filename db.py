@@ -6,6 +6,8 @@
   sent_log    — журнал уже отправленных уведомлений (защита от повторов)
 """
 
+from __future__ import annotations  # чтобы код работал и на Python 3.9
+
 import sqlite3
 import threading
 from datetime import date, timedelta

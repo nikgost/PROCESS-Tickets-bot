@@ -1,5 +1,7 @@
 """Обработка команд и нажатий на кнопки."""
 
+from __future__ import annotations  # чтобы код работал и на Python 3.9
+
 import html
 import logging
 
