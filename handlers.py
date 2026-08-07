@@ -1,0 +1,733 @@
+"""Обработка команд и нажатий на кнопки."""
+
+import html
+import logging
+
+from aiogram import BaseMiddleware, Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, ChatMemberUpdated, ForceReply, Message
+
+import config
+import db
+import keyboards
+import qtickets
+import reports
+from qtickets import QTicketsError
+
+log = logging.getLogger(__name__)
+router = Router()
+
+CONFIRM_FLOW_TEXT = (
+    "Вы уверены, что хотите отменить текущую активность и перейти в главное меню?\n\n"
+    "Сейчас ожидается: отправьте ID мероприятия."
+)
+
+HELP_TEXT = (
+    "<b>Что я умею</b>\n\n"
+    "Я присылаю в чат отчёты о купленных билетах из QTickets — по расписанию "
+    "и по запросу.\n\n"
+    "Команды:\n"
+    "/menu — главное меню (все настройки — кнопками)\n"
+    "/report — отчёт за сегодня прямо сейчас\n"
+    "/help — эта справка\n\n"
+    "Как это устроено:\n"
+    "• В каждый чат можно добавить несколько мероприятий (по их ID из QTickets).\n"
+    "• Расписание уведомлений бывает общим для чата и своим у каждого "
+    "мероприятия. Своё расписание важнее общего.\n"
+    "• «Сегодня» и время отправки бот считает по часовому поясу чата "
+    "(меняется в меню)."
+)
+
+
+class AddEventState(StatesGroup):
+    waiting_id = State()
+
+
+# ---------- Вспомогательные ----------
+
+async def safe_edit(msg: Message, text: str, kb=None) -> None:
+    """Изменить сообщение; молча пропустить ошибку «текст не изменился»."""
+    try:
+        await msg.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+
+
+def menu_text(chat_row) -> str:
+    n = db.count_events(chat_row["chat_id"])
+    ntf = "✅ включены" if chat_row["enabled"] else "🔕 выключены"
+    sched = reports.format_schedule(chat_row["days_mask"], chat_row["send_time"]) or "не задано"
+    return (
+        "<b>Меню бота</b>\n\n"
+        f"Уведомления: {ntf}\n"
+        f"Часовой пояс: {config.tz_label(chat_row['tz'])}\n"
+        f"Общее расписание: {sched}\n"
+        f"Мероприятий в этом чате: {n}"
+    )
+
+
+async def render_menu(cb: CallbackQuery) -> None:
+    chat = db.get_chat(cb.message.chat.id)
+    await safe_edit(
+        cb.message, menu_text(chat), keyboards.kb_main(chat, db.count_events(chat["chat_id"]))
+    )
+
+
+async def run_report(bot: Bot, chat_id: int) -> None:
+    chat = db.get_chat(chat_id)
+    events = db.get_events(chat_id)
+    note = await bot.send_message(chat_id, "⏳ Собираю данные из QTickets…")
+    try:
+        text = await reports.build_report(qtickets.get_client(), chat, events)
+    except Exception as e:
+        log.exception("Сбой отчёта в чате %s", chat_id)
+        text = f"⚠️ Не получилось собрать отчёт: {html.escape(str(e))}"
+    await safe_edit(note, text)
+
+
+def _chat_title(message: Message) -> str:
+    if message.chat.title:
+        return message.chat.title
+    if message.from_user:
+        return message.from_user.full_name
+    return "Чат"
+
+
+# ---------- Доступ: кнопки может нажимать только владелец ----------
+
+class OwnerCallbackMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: CallbackQuery, data):
+        if not config.is_owner(event.from_user.id):
+            await event.answer("Эта кнопка доступна только владельцу бота.", show_alert=True)
+            return None
+        if event.message is None:
+            await event.answer("Сообщение устарело. Откройте меню заново: /menu", show_alert=True)
+            return None
+        return await handler(event, data)
+
+
+router.callback_query.middleware(OwnerCallbackMiddleware())
+
+
+# ---------- Добавление и удаление бота из чатов ----------
+
+def _is_member(m) -> bool:
+    return m.status in ("member", "administrator") or (
+        m.status == "restricted" and bool(getattr(m, "is_member", False))
+    )
+
+
+@router.my_chat_member()
+async def on_membership(update: ChatMemberUpdated, bot: Bot):
+    was = _is_member(update.old_chat_member)
+    now = _is_member(update.new_chat_member)
+    chat = update.chat
+
+    if now and not was:
+        if chat.type == "channel":
+            try:
+                await bot.send_message(
+                    chat.id, "Каналы я не поддерживаю — добавьте меня в группу."
+                )
+            except Exception:
+                pass
+            await bot.leave_chat(chat.id)
+            return
+        actor = update.from_user
+        if actor is None or not config.is_owner(actor.id):
+            log.info("Бота добавил посторонний (%s) в чат %s — выхожу", actor, chat.id)
+            try:
+                await bot.send_message(
+                    chat.id, "Это личный бот, он работает только для своего владельца."
+                )
+            except Exception:
+                pass
+            try:
+                await bot.leave_chat(chat.id)
+            except Exception:
+                pass
+            db_row = None
+            try:
+                db_row = db.get_chat(chat.id)
+            finally:
+                if db_row is not None:
+                    db.set_enabled(chat.id, 0)
+            return
+        db.get_chat(chat.id, chat.title or "Чат")
+        try:
+            await bot.send_message(
+                chat.id,
+                "Привет! Я буду присылать сюда отчёты о купленных билетах.\n"
+                "Откройте меню: /menu",
+            )
+        except Exception:
+            pass
+        return
+
+    if was and not now:
+        # Бота убрали из чата: настройки не стираем, только выключаем уведомления,
+        # чтобы при возврате бота всё осталось на месте.
+        db.set_enabled(chat.id, 0)
+
+
+@router.message(F.migrate_to_chat_id)
+async def on_migrate(message: Message):
+    # Телеграм превратил группу в супергруппу — переносим настройки на новый ID чата
+    db.migrate_chat(message.chat.id, message.migrate_to_chat_id)
+    log.info("Чат %s переехал на %s", message.chat.id, message.migrate_to_chat_id)
+
+
+# ---------- Команды ----------
+
+@router.message(Command("start", "menu"))
+async def cmd_menu(message: Message, state: FSMContext):
+    if message.chat.type == "channel":
+        return
+    user_id = message.from_user.id if message.from_user else None
+    if not config.is_owner(user_id):
+        if message.chat.type == "private":
+            await message.answer("Это личный бот, доступ к нему ограничен.")
+        return
+    if await state.get_state():
+        await message.answer(CONFIRM_FLOW_TEXT, reply_markup=keyboards.kb_flow_confirm())
+        return
+    chat = db.get_chat(message.chat.id, _chat_title(message))
+    await message.answer(
+        menu_text(chat), reply_markup=keyboards.kb_main(chat, db.count_events(chat["chat_id"]))
+    )
+
+
+@router.message(Command("report"))
+async def cmd_report(message: Message):
+    user_id = message.from_user.id if message.from_user else None
+    if not config.is_owner(user_id):
+        if message.chat.type == "private":
+            await message.answer("Это личный бот, доступ к нему ограничен.")
+        return
+    db.get_chat(message.chat.id, _chat_title(message))
+    await run_report(message.bot, message.chat.id)
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    if not config.is_owner(message.from_user.id if message.from_user else None):
+        return
+    await message.answer(HELP_TEXT)
+
+
+# ---------- Ввод ID мероприятия вручную ----------
+
+@router.message(AddEventState.waiting_id)
+async def got_event_id(message: Message, state: FSMContext):
+    if not config.is_owner(message.from_user.id if message.from_user else None):
+        return
+    data = await state.get_data()
+    prompt_id = data.get("prompt_id")
+    in_group = message.chat.type != "private"
+    if in_group:
+        # В группе принимаем только ответ на наше сообщение-приглашение —
+        # так работает даже при включённом «режиме конфиденциальности» бота.
+        if not message.reply_to_message or message.reply_to_message.message_id != prompt_id:
+            return
+
+    text = (message.text or "").strip()
+    if text.startswith("/"):
+        await message.reply(
+            "Сейчас я жду ID мероприятия. Чтобы выйти в меню — отправьте /menu."
+        )
+        return
+    if not text.isdigit():
+        hint = " (ответом на моё сообщение выше)" if in_group else ""
+        await message.reply(
+            f"Нужно число — ID мероприятия из QTickets. Попробуйте ещё раз{hint}."
+        )
+        return
+
+    event_id = int(text)
+    note = await message.reply("⏳ Проверяю мероприятие в QTickets…")
+    try:
+        info = await qtickets.get_client().get_event(event_id)
+    except QTicketsError as e:
+        hint = " ответом на моё первое сообщение" if in_group else ""
+        await safe_edit(
+            note,
+            f"⚠️ {html.escape(str(e))}\nПроверьте ID и отправьте ещё раз{hint}.",
+        )
+        return
+    except Exception:
+        log.exception("Сбой проверки мероприятия %s", event_id)
+        await safe_edit(note, "⚠️ Внутренняя ошибка. Попробуйте ещё раз позже.")
+        return
+
+    await state.clear()
+    added = db.add_event(message.chat.id, event_id, info["name"])
+    if added:
+        await safe_edit(
+            note,
+            f"✅ Добавлено: «{html.escape(info['name'])}».\n"
+            "Пока для него действует общее расписание чата.",
+            keyboards.kb_after_add(event_id),
+        )
+    else:
+        await safe_edit(
+            note,
+            f"Мероприятие «{html.escape(info['name'])}» уже добавлено в этот чат.",
+            keyboards.kb_back_menu(),
+        )
+
+
+@router.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
+async def private_text(message: Message, state: FSMContext):
+    if not config.is_owner(message.from_user.id if message.from_user else None):
+        await message.answer("Это личный бот, доступ к нему ограничен.")
+        return
+    if (message.text or "").strip().lower() in ("старт", "меню", "start", "menu"):
+        chat = db.get_chat(message.chat.id, _chat_title(message))
+        await message.answer(
+            menu_text(chat),
+            reply_markup=keyboards.kb_main(chat, db.count_events(chat["chat_id"])),
+        )
+        return
+    await message.answer("Откройте меню командой /menu")
+
+
+# ---------- Кнопки: базовые ----------
+
+@router.callback_query(F.data == "m")
+async def cb_menu(cb: CallbackQuery):
+    await cb.answer()
+    await render_menu(cb)
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(cb: CallbackQuery):
+    await cb.answer()
+
+
+@router.callback_query(F.data == "rep")
+async def cb_report(cb: CallbackQuery):
+    await cb.answer("Собираю отчёт…")
+    await run_report(cb.bot, cb.message.chat.id)
+
+
+@router.callback_query(F.data == "ntf")
+async def cb_notifications(cb: CallbackQuery):
+    chat = db.get_chat(cb.message.chat.id)
+    new_value = 0 if chat["enabled"] else 1
+    db.set_enabled(chat["chat_id"], new_value)
+    await cb.answer("Уведомления включены" if new_value else "Уведомления выключены")
+    await render_menu(cb)
+
+
+# ---------- Кнопки: часовой пояс ----------
+
+@router.callback_query(F.data == "tz")
+async def cb_tz(cb: CallbackQuery):
+    await cb.answer()
+    chat = db.get_chat(cb.message.chat.id)
+    await safe_edit(
+        cb.message,
+        "🌍 <b>Часовой пояс этого чата</b>\n\n"
+        "По нему бот понимает, что такое «сегодня», и во сколько отправлять "
+        "уведомления. Выберите пояс города, где идут показы:",
+        keyboards.kb_timezones(chat["tz"]),
+    )
+
+
+@router.callback_query(F.data.startswith("tzs:"))
+async def cb_tz_set(cb: CallbackQuery):
+    try:
+        index = int(cb.data.split(":")[1])
+        tz_name, tz_lbl = config.TIMEZONES[index]
+    except (ValueError, IndexError):
+        await cb.answer("Кнопка устарела. Откройте меню заново: /menu", show_alert=True)
+        return
+    db.get_chat(cb.message.chat.id)
+    db.set_tz(cb.message.chat.id, tz_name)
+    await cb.answer(f"Сохранено: {tz_lbl}")
+    await render_menu(cb)
+
+
+# ---------- Кнопки: список мероприятий чата ----------
+
+async def render_events_list(cb: CallbackQuery, page: int) -> None:
+    events = db.get_events(cb.message.chat.id)
+    max_page = max(0, (len(events) - 1) // keyboards.EVENTS_PER_PAGE)
+    page = min(max(page, 0), max_page)
+    if events:
+        text = (
+            "🎭 <b>Мероприятия этого чата</b>\n\n"
+            "Нажмите на мероприятие, чтобы настроить или удалить его."
+        )
+    else:
+        text = (
+            "🎭 <b>Мероприятия этого чата</b>\n\n"
+            "Пока пусто. Нажмите «Добавить мероприятие»."
+        )
+    await safe_edit(cb.message, text, keyboards.kb_events_list(events, page))
+
+
+@router.callback_query(F.data.startswith("evl:"))
+async def cb_events_list(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        page = int(cb.data.split(":")[1])
+    except (ValueError, IndexError):
+        page = 0
+    await render_events_list(cb, page)
+
+
+async def render_event_card(cb: CallbackQuery, event_id: int) -> None:
+    ev = db.get_event(cb.message.chat.id, event_id)
+    if ev is None:
+        await cb.answer("Этого мероприятия уже нет в чате.", show_alert=True)
+        await render_events_list(cb, 0)
+        return
+    chat = db.get_chat(cb.message.chat.id)
+    mask, send_time, own = reports.effective_schedule(ev, chat)
+    sched = reports.format_schedule(mask, send_time)
+    if sched and own:
+        sched_line = f"своё: {sched}"
+    elif sched:
+        sched_line = f"общее для чата: {sched}"
+    else:
+        sched_line = "не задано — задайте своё или общее расписание"
+    name = ev["name"] or f"Мероприятие {event_id}"
+    text = (
+        f"🎭 <b>«{html.escape(name)}»</b>\n"
+        f"ID в QTickets: <code>{event_id}</code>\n\n"
+        f"Расписание уведомлений: {sched_line}"
+    )
+    await safe_edit(cb.message, text, keyboards.kb_event_card(ev, own))
+
+
+@router.callback_query(F.data.startswith("evc:"))
+async def cb_event_card(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        event_id = int(cb.data.split(":")[1])
+    except (ValueError, IndexError):
+        await render_events_list(cb, 0)
+        return
+    await render_event_card(cb, event_id)
+
+
+@router.callback_query(F.data.startswith("evdc:"))
+async def cb_event_delete_confirmed(cb: CallbackQuery):
+    try:
+        event_id = int(cb.data.split(":")[1])
+    except (ValueError, IndexError):
+        await cb.answer()
+        return
+    ev = db.get_event(cb.message.chat.id, event_id)
+    db.remove_event(cb.message.chat.id, event_id)
+    name = (ev["name"] if ev else None) or f"Мероприятие {event_id}"
+    await cb.answer(f"«{name}» удалено из чата")
+    await render_events_list(cb, 0)
+
+
+@router.callback_query(F.data.startswith("evd:"))
+async def cb_event_delete_ask(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        event_id = int(cb.data.split(":")[1])
+    except (ValueError, IndexError):
+        return
+    ev = db.get_event(cb.message.chat.id, event_id)
+    if ev is None:
+        await render_events_list(cb, 0)
+        return
+    name = ev["name"] or f"Мероприятие {event_id}"
+    await safe_edit(
+        cb.message,
+        f"Удалить «{html.escape(name)}» из этого чата?\n"
+        "Авто-уведомления по нему больше приходить не будут.",
+        keyboards.kb_delete_confirm(event_id),
+    )
+
+
+# ---------- Кнопки: добавление мероприятия ----------
+
+@router.callback_query(F.data.startswith("add:"))
+async def cb_add_list(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        page = int(cb.data.split(":")[1])
+    except (ValueError, IndexError):
+        page = 0
+    await safe_edit(cb.message, "⏳ Загружаю список мероприятий из QTickets…")
+    try:
+        items = await qtickets.get_client().list_events()
+    except QTicketsError as e:
+        await safe_edit(
+            cb.message,
+            f"⚠️ {html.escape(str(e))}\n\nМожно добавить мероприятие по ID вручную.",
+            keyboards.kb_add_fallback(),
+        )
+        return
+    if not items:
+        await safe_edit(
+            cb.message,
+            "В QTickets не нашлось ни одного мероприятия.\n"
+            "Можно добавить мероприятие по ID вручную.",
+            keyboards.kb_add_fallback(),
+        )
+        return
+    added_ids = {ev["event_id"] for ev in db.get_events(cb.message.chat.id)}
+    max_page = max(0, (len(items) - 1) // keyboards.EVENTS_PER_PAGE)
+    page = min(max(page, 0), max_page)
+    await safe_edit(
+        cb.message,
+        "➕ <b>Добавить мероприятие</b>\n\n"
+        "Выберите мероприятие из вашего QTickets (новые — сверху).\n"
+        "✅ — уже добавлено в этот чат.",
+        keyboards.kb_add_list(items, added_ids, page),
+    )
+
+
+@router.callback_query(F.data.startswith("pick:"))
+async def cb_pick(cb: CallbackQuery):
+    try:
+        event_id = int(cb.data.split(":")[1])
+    except (ValueError, IndexError):
+        await cb.answer()
+        return
+    if db.get_event(cb.message.chat.id, event_id):
+        await cb.answer("Уже добавлено в этот чат.", show_alert=True)
+        return
+    await cb.answer()
+    await safe_edit(cb.message, "⏳ Проверяю мероприятие в QTickets…")
+    try:
+        info = await qtickets.get_client().get_event(event_id)
+    except QTicketsError as e:
+        await safe_edit(
+            cb.message,
+            f"⚠️ {html.escape(str(e))}",
+            keyboards.kb_add_fallback(),
+        )
+        return
+    db.add_event(cb.message.chat.id, event_id, info["name"])
+    await safe_edit(
+        cb.message,
+        f"✅ Добавлено: «{html.escape(info['name'])}».\n"
+        "Пока для него действует общее расписание чата.",
+        keyboards.kb_after_add(event_id),
+    )
+
+
+@router.callback_query(F.data == "man")
+async def cb_manual(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    prompt = await cb.message.answer(
+        "Отправьте числовой ID мероприятия из QTickets — ответом на это сообщение.\n"
+        "ID можно посмотреть в личном кабинете QTickets в адресной строке "
+        "страницы мероприятия.",
+        reply_markup=ForceReply(selective=True, input_field_placeholder="ID мероприятия"),
+    )
+    await state.set_state(AddEventState.waiting_id)
+    await state.update_data(prompt_id=prompt.message_id)
+
+
+# ---------- Кнопки: настройка расписания ----------
+
+def _scope_event(cb: CallbackQuery, scope: str):
+    """Для scope-мероприятия вернуть его строку из базы (или None, если удалено)."""
+    if scope == "c":
+        return "c", None
+    try:
+        event_id = int(scope)
+    except ValueError:
+        return None, None
+    return scope, db.get_event(cb.message.chat.id, event_id)
+
+
+async def render_days(cb: CallbackQuery, scope: str, mask: int) -> None:
+    chat = db.get_chat(cb.message.chat.id)
+    if scope == "c":
+        title = "Общее расписание чата"
+    else:
+        _, ev = _scope_event(cb, scope)
+        if ev is None:
+            await cb.answer("Этого мероприятия уже нет в чате.", show_alert=True)
+            await render_menu(cb)
+            return
+        name = ev["name"] or f"Мероприятие {scope}"
+        title = f"Расписание «{html.escape(name)}»"
+    await safe_edit(
+        cb.message,
+        f"⏰ <b>{title}</b>\n\n"
+        "1. Отметьте дни недели, когда присылать отчёт.\n"
+        "2. Нажмите «Далее», чтобы выбрать время.\n\n"
+        f"Выбрано: {reports.format_days(mask)}\n"
+        f"Часовой пояс чата: {config.tz_label(chat['tz'])}",
+        keyboards.kb_days(scope, mask),
+    )
+
+
+@router.callback_query(F.data.startswith("sdt:"))
+async def cb_day_toggle(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        _, scope, mask, day = cb.data.split(":")
+        mask, day = int(mask), int(day)
+    except (ValueError, IndexError):
+        await render_menu(cb)
+        return
+    await render_days(cb, scope, mask ^ (1 << day))
+
+
+@router.callback_query(F.data.startswith("sda:"))
+async def cb_day_all(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        _, scope, mask = cb.data.split(":")
+        mask = int(mask)
+    except (ValueError, IndexError):
+        await render_menu(cb)
+        return
+    await render_days(cb, scope, 0 if mask >= 127 else 127)
+
+
+@router.callback_query(F.data.startswith("sd:"))
+async def cb_days(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        _, scope, mask = cb.data.split(":")
+        mask = int(mask)
+    except (ValueError, IndexError):
+        await render_menu(cb)
+        return
+    await render_days(cb, scope, mask)
+
+
+@router.callback_query(F.data.startswith("shp:"))
+async def cb_hour_picked(cb: CallbackQuery):
+    await cb.answer()
+    try:
+        _, scope, mask, hour = cb.data.split(":")
+        mask, hour = int(mask), int(hour)
+    except (ValueError, IndexError):
+        await render_menu(cb)
+        return
+    await safe_edit(
+        cb.message,
+        f"⏰ Час: <b>{hour:02d}</b>. Теперь выберите минуты:",
+        keyboards.kb_minutes(scope, mask, hour),
+    )
+
+
+@router.callback_query(F.data.startswith("sh:"))
+async def cb_hours(cb: CallbackQuery):
+    try:
+        _, scope, mask = cb.data.split(":")
+        mask = int(mask)
+    except (ValueError, IndexError):
+        await cb.answer()
+        await render_menu(cb)
+        return
+    if mask == 0:
+        await cb.answer("Сначала отметьте хотя бы один день.", show_alert=True)
+        return
+    await cb.answer()
+    chat = db.get_chat(cb.message.chat.id)
+    await safe_edit(
+        cb.message,
+        f"⏰ Выберите час отправки (пояс чата: {config.tz_label(chat['tz'])}):",
+        keyboards.kb_hours(scope, mask),
+    )
+
+
+@router.callback_query(F.data.startswith("sm:"))
+async def cb_save_schedule(cb: CallbackQuery):
+    try:
+        _, scope, mask, hour, minute = cb.data.split(":")
+        mask, hour, minute = int(mask), int(hour), int(minute)
+    except (ValueError, IndexError):
+        await cb.answer()
+        await render_menu(cb)
+        return
+    if mask <= 0 or not (0 <= hour <= 23) or not (0 <= minute <= 59):
+        await cb.answer("Что-то пошло не так, начните заново.", show_alert=True)
+        await render_menu(cb)
+        return
+    send_time = f"{hour:02d}:{minute:02d}"
+    chat_id = cb.message.chat.id
+    db.get_chat(chat_id)
+    if scope == "c":
+        db.set_chat_schedule(chat_id, mask, send_time)
+        label = "общее для чата"
+    else:
+        _, ev = _scope_event(cb, scope)
+        if ev is None:
+            await cb.answer("Этого мероприятия уже нет в чате.", show_alert=True)
+            await render_menu(cb)
+            return
+        db.set_event_schedule(chat_id, int(scope), mask, send_time)
+        name = ev["name"] or f"Мероприятие {scope}"
+        label = f"для «{html.escape(name)}»"
+    await cb.answer("Расписание сохранено")
+    await safe_edit(
+        cb.message,
+        f"✅ Расписание сохранено ({label}):\n"
+        f"<b>{reports.format_days(mask)} в {send_time}</b>",
+        keyboards.kb_after_schedule(scope),
+    )
+
+
+@router.callback_query(F.data.startswith("scl"))
+async def cb_clear_schedule(cb: CallbackQuery):
+    parts = cb.data.split(":")
+    scope = parts[1] if len(parts) > 1 else "c"
+    chat_id = cb.message.chat.id
+    db.get_chat(chat_id)
+    if scope == "c":
+        db.set_chat_schedule(chat_id, None, None)
+        await cb.answer("Общее расписание очищено")
+        await safe_edit(
+            cb.message,
+            "Общее расписание очищено.\n"
+            "Авто-уведомления теперь приходят только по мероприятиям, "
+            "у которых задано своё расписание.",
+            keyboards.kb_back_menu(),
+        )
+        return
+    _, ev = _scope_event(cb, scope)
+    if ev is None:
+        await cb.answer()
+        await render_menu(cb)
+        return
+    db.set_event_schedule(chat_id, int(scope), None, None)
+    name = ev["name"] or f"Мероприятие {scope}"
+    await cb.answer("Готово")
+    await safe_edit(
+        cb.message,
+        f"«{html.escape(name)}» снова использует общее расписание чата.",
+        keyboards.kb_after_schedule(scope),
+    )
+
+
+# ---------- Кнопки: подтверждение выхода из текущего действия ----------
+
+@router.callback_query(F.data == "fc")
+async def cb_flow_cancel(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.answer()
+    await render_menu(cb)
+
+
+@router.callback_query(F.data == "fs")
+async def cb_flow_stay(cb: CallbackQuery):
+    await cb.answer()
+    await safe_edit(
+        cb.message,
+        "Хорошо, продолжаем. Отправьте ID мероприятия ответом на моё сообщение выше.",
+    )
+
+
+@router.callback_query()
+async def cb_unknown(cb: CallbackQuery):
+    await cb.answer("Кнопка устарела. Откройте меню заново: /menu", show_alert=True)
