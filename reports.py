@@ -15,6 +15,107 @@ log = logging.getLogger(__name__)
 
 DAY_NAMES = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
+# --- Разбор дней недели и времени, введённых текстом ---
+
+# Одно слово — один день. Учтены сокращения, полные названия и падежи.
+_DAY_WORDS = {
+    "пн": 0, "по": 0, "понедельник": 0, "понедельники": 0, "mon": 0, "monday": 0,
+    "вт": 1, "вторник": 1, "вторники": 1, "tue": 1, "tuesday": 1,
+    "ср": 2, "среда": 2, "среду": 2, "среды": 2, "wed": 2, "wednesday": 2,
+    "чт": 3, "четверг": 3, "четверги": 3, "thu": 3, "thursday": 3,
+    "пт": 4, "пятница": 4, "пятницу": 4, "пятницы": 4, "fri": 4, "friday": 4,
+    "сб": 5, "суббота": 5, "субботу": 5, "субботы": 5, "sat": 5, "saturday": 5,
+    "вс": 6, "вск": 6, "воскресенье": 6, "воскресенья": 6, "sun": 6, "sunday": 6,
+}
+
+# Слово — сразу набор дней.
+_DAY_GROUPS = {
+    "каждыйдень": 0b1111111, "каждый": 0b1111111, "ежедневно": 0b1111111,
+    "всегда": 0b1111111, "все": 0b1111111, "вседни": 0b1111111, "всюнеделю": 0b1111111,
+    "будни": 0b0011111, "рабочие": 0b0011111, "рабочиедни": 0b0011111,
+    "выходные": 0b1100000, "выхи": 0b1100000,
+}
+
+
+# Слова, которые в ответе можно просто пропустить.
+_FILLER_WORDS = {"день", "дни", "дня", "недели", "неделю", "по", "в", "во", "и", "а", "также"}
+
+
+def parse_days(text: str) -> tuple[int | None, str | None]:
+    """Разобрать дни недели из текста вроде «вт, ср, чт», «пн-пт», «будни».
+
+    Возвращает (набор дней, непонятое слово). Если всё разобрано — второе None.
+    """
+    if not text:
+        return None, None
+    cleaned = text.lower().replace("ё", "е").strip()
+    for sep in (",", ";", "/", "\\", "|", "+", " и ", ".", "\n"):
+        cleaned = cleaned.replace(sep, " ")
+    for dash in ("—", "–", "‒", "−"):
+        cleaned = cleaned.replace(dash, "-")
+
+    mask = 0
+    # Сначала пробуем всю строку целиком — так ловятся фразы из двух слов
+    # («каждый день», «все дни», «рабочие дни»).
+    whole = cleaned.replace(" ", "").replace("-", "")
+    if whole in _DAY_GROUPS:
+        return _DAY_GROUPS[whole], None
+
+    for token in cleaned.split():
+        token = token.strip("-").strip()
+        if not token or token in _FILLER_WORDS:
+            continue
+        if token in _DAY_GROUPS:
+            mask |= _DAY_GROUPS[token]
+            continue
+        if "-" in token:  # диапазон, например «пн-чт» или «пт-вс»
+            left, _, right = token.partition("-")
+            if left in _DAY_WORDS and right in _DAY_WORDS:
+                start, end = _DAY_WORDS[left], _DAY_WORDS[right]
+                day = start
+                while True:
+                    mask |= 1 << day
+                    if day == end:
+                        break
+                    day = (day + 1) % 7
+                continue
+            return None, token
+        if token in _DAY_WORDS:
+            mask |= 1 << _DAY_WORDS[token]
+            continue
+        return None, token
+
+    return (mask or None), None
+
+
+def parse_time(text: str) -> str | None:
+    """Разобрать время из «18:32», «18.32», «1832», «18 32», «9» и т. п."""
+    if not text:
+        return None
+    cleaned = text.lower().strip()
+    for word in ("в", "часов", "час", "ч", "мин", "минут"):
+        cleaned = cleaned.replace(word, " ")
+    digits_only = "".join(ch for ch in cleaned if ch.isdigit() or ch in " :.-,")
+    for sep in (".", "-", ",", " "):
+        digits_only = digits_only.replace(sep, ":")
+    parts = [p for p in digits_only.split(":") if p != ""]
+
+    if len(parts) == 1:
+        chunk = parts[0]
+        if len(chunk) in (3, 4) and chunk.isdigit():  # «1832» или «932»
+            parts = [chunk[:-2], chunk[-2:]]
+        elif chunk.isdigit() and len(chunk) <= 2:  # «18» — значит ровно 18:00
+            parts = [chunk, "0"]
+        else:
+            return None
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        return None
+
+    hour, minute = int(parts[0]), int(parts[1])
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
 
 def format_days(mask: int | None) -> str:
     if not mask:

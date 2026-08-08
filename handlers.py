@@ -23,10 +23,21 @@ from qtickets import QTicketsError
 log = logging.getLogger(__name__)
 router = Router()
 
-CONFIRM_FLOW_TEXT = (
+CONFIRM_FLOW_BASE = (
     "Вы уверены, что хотите отменить текущую активность и перейти в главное меню?\n\n"
-    "Сейчас ожидается: отправьте ID мероприятия."
+    "Сейчас ожидается: {what}"
 )
+
+_WAITING_HINTS = {
+    "AddEventState:waiting_id": "отправьте ID мероприятия.",
+    "ScheduleInput:waiting_days": "напишите дни недели.",
+    "ScheduleInput:waiting_time": "напишите время отправки.",
+}
+
+
+def confirm_flow_text(state_name: str | None) -> str:
+    what = _WAITING_HINTS.get(state_name or "", "завершите текущее действие.")
+    return CONFIRM_FLOW_BASE.format(what=what)
 
 HELP_TEXT = (
     "<b>Что я умею</b>\n\n"
@@ -47,6 +58,29 @@ HELP_TEXT = (
 
 class AddEventState(StatesGroup):
     waiting_id = State()
+
+
+class ScheduleInput(StatesGroup):
+    """Ввод расписания текстом: сначала дни недели, потом время."""
+
+    waiting_days = State()
+    waiting_time = State()
+
+
+DAYS_PROMPT = (
+    "✍️ <b>Напишите дни недели</b> — ответом на это сообщение.\n\n"
+    "Например:\n"
+    "• <code>вт, ср, чт</code>\n"
+    "• <code>понедельник, среда</code>\n"
+    "• <code>пн-пт</code> — с понедельника по пятницу\n"
+    "• <code>будни</code> · <code>выходные</code> · <code>каждый день</code>"
+)
+
+TIME_PROMPT = (
+    "✍️ <b>Напишите время отправки</b> — ответом на это сообщение.\n\n"
+    "Например: <code>18:32</code>, <code>9:05</code>, <code>1930</code>\n"
+    "Время по часовому поясу чата: {tz}"
+)
 
 
 # ---------- Вспомогательные ----------
@@ -215,8 +249,11 @@ async def cmd_menu(message: Message, state: FSMContext):
         if message.chat.type == "private":
             await message.answer("Это личный бот, доступ к нему ограничен.")
         return
-    if await state.get_state():
-        await message.answer(CONFIRM_FLOW_TEXT, reply_markup=keyboards.kb_flow_confirm())
+    current = await state.get_state()
+    if current:
+        await message.answer(
+            confirm_flow_text(current), reply_markup=keyboards.kb_flow_confirm()
+        )
         return
     chat = db.get_chat(message.chat.id, _chat_title(message))
     sent = await message.answer(
@@ -304,6 +341,118 @@ async def got_event_id(message: Message, state: FSMContext):
             f"Мероприятие «{html.escape(info['name'])}» уже добавлено в этот чат.",
             keyboards.kb_back_menu(),
         )
+
+
+# ---------- Ввод расписания текстом ----------
+
+async def _ask(message: Message, text: str, placeholder: str) -> int:
+    """Задать вопрос с подсказкой и полем для ответа. Вернуть номер сообщения."""
+    prompt = await message.answer(
+        text,
+        reply_markup=ForceReply(selective=True, input_field_placeholder=placeholder),
+    )
+    cleanup.schedule(message.bot, message.chat.id, prompt.message_id, cleanup.MENU_LIFETIME)
+    return prompt.message_id
+
+
+def _is_reply_to_prompt(message: Message, prompt_id) -> bool:
+    """В группе принимаем только ответ на наше сообщение — так работает
+    даже при включённом «режиме конфиденциальности» бота."""
+    if message.chat.type == "private":
+        return True
+    return bool(message.reply_to_message) and message.reply_to_message.message_id == prompt_id
+
+
+@router.message(ScheduleInput.waiting_days)
+async def got_days_text(message: Message, state: FSMContext):
+    if not config.is_owner(message.from_user.id if message.from_user else None):
+        return
+    data = await state.get_data()
+    if not _is_reply_to_prompt(message, data.get("prompt_id")):
+        return
+
+    text = (message.text or "").strip()
+    if text.startswith("/"):
+        await message.reply("Сейчас я жду дни недели. Чтобы выйти в меню — отправьте /menu.")
+        return
+
+    mask, unknown = reports.parse_days(text)
+    if mask is None:
+        if unknown:
+            hint = f"Не понял слово «{html.escape(unknown)}». "
+        else:
+            hint = "Не разобрал, какие это дни. "
+        await message.reply(
+            hint + "Напишите так: <code>вт, ср, чт</code> или <code>будни</code>."
+        )
+        return
+
+    if data.get("prompt_id"):
+        await cleanup.delete_now(message.bot, message.chat.id, data["prompt_id"])
+
+    chat = db.get_chat(message.chat.id, _chat_title(message))
+    await state.set_state(ScheduleInput.waiting_time)
+    prompt_id = await _ask(
+        message,
+        f"Дни приняты: <b>{reports.format_days(mask)}</b>\n\n"
+        + TIME_PROMPT.format(tz=config.tz_label(chat["tz"])),
+        "18:32",
+    )
+    await state.update_data(mask=mask, prompt_id=prompt_id)
+
+
+@router.message(ScheduleInput.waiting_time)
+async def got_time_text(message: Message, state: FSMContext):
+    if not config.is_owner(message.from_user.id if message.from_user else None):
+        return
+    data = await state.get_data()
+    if not _is_reply_to_prompt(message, data.get("prompt_id")):
+        return
+
+    text = (message.text or "").strip()
+    if text.startswith("/"):
+        await message.reply("Сейчас я жду время. Чтобы выйти в меню — отправьте /menu.")
+        return
+
+    send_time = reports.parse_time(text)
+    if send_time is None:
+        await message.reply(
+            "Не разобрал время. Напишите часы и минуты, например: "
+            "<code>18:32</code> или <code>9:05</code>."
+        )
+        return
+
+    scope = str(data.get("scope", "c"))
+    mask = int(data.get("mask") or 0)
+    if mask <= 0:
+        await state.clear()
+        await message.reply("Что-то пошло не так — начните заново из меню: /menu")
+        return
+
+    chat_id = message.chat.id
+    db.get_chat(chat_id, _chat_title(message))
+    if scope == "c":
+        db.set_chat_schedule(chat_id, mask, send_time)
+        label = "общее для чата"
+    else:
+        ev = db.get_event(chat_id, int(scope))
+        if ev is None:
+            await state.clear()
+            await message.reply("Этого мероприятия уже нет в чате. Откройте меню: /menu")
+            return
+        db.set_event_schedule(chat_id, int(scope), mask, send_time)
+        label = f"для «{html.escape(ev['name'] or scope)}»"
+
+    if data.get("prompt_id"):
+        await cleanup.delete_now(message.bot, chat_id, data["prompt_id"])
+    await state.clear()
+
+    done = await message.answer(
+        f"✅ Расписание сохранено ({label}):\n"
+        f"<b>{reports.format_days(mask)} в {send_time}</b>",
+        reply_markup=keyboards.kb_after_schedule(scope),
+    )
+    cleanup.schedule(message.bot, chat_id, done.message_id, cleanup.MENU_LIFETIME)
 
 
 @router.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
@@ -568,6 +717,19 @@ async def cb_manual(cb: CallbackQuery, state: FSMContext):
     await state.update_data(prompt_id=prompt.message_id)
 
 
+@router.callback_query(F.data.startswith("tw:"))
+async def cb_text_schedule(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    scope = cb.data.split(":", 1)[1]
+    if scope != "c" and db.get_event(cb.message.chat.id, int(scope)) is None:
+        await cb.answer("Этого мероприятия уже нет в чате.", show_alert=True)
+        await render_menu(cb)
+        return
+    prompt_id = await _ask(cb.message, DAYS_PROMPT, "вт, ср, чт")
+    await state.set_state(ScheduleInput.waiting_days)
+    await state.update_data(scope=scope, prompt_id=prompt_id)
+
+
 # ---------- Кнопки: настройка расписания ----------
 
 def _scope_event(cb: CallbackQuery, scope: str):
@@ -581,10 +743,16 @@ def _scope_event(cb: CallbackQuery, scope: str):
     return scope, db.get_event(cb.message.chat.id, event_id)
 
 
-async def render_days(cb: CallbackQuery, scope: str, mask: int) -> None:
+async def render_schedule(cb: CallbackQuery, scope: str) -> None:
+    """Экран расписания: что сейчас задано и как это изменить."""
     chat = db.get_chat(cb.message.chat.id)
     if scope == "c":
         title = "Общее расписание чата"
+        current = reports.format_schedule(chat["days_mask"], chat["send_time"])
+        has_override = False
+        note = (
+            "Действует на все мероприятия чата, у которых нет своего расписания."
+        )
     else:
         _, ev = _scope_event(cb, scope)
         if ev is None:
@@ -593,125 +761,32 @@ async def render_days(cb: CallbackQuery, scope: str, mask: int) -> None:
             return
         name = ev["name"] or f"Мероприятие {scope}"
         title = f"Расписание «{html.escape(name)}»"
+        mask, send_time, has_override = reports.effective_schedule(ev, chat)
+        current = reports.format_schedule(mask, send_time)
+        if current and not has_override:
+            current += " (общее для чата)"
+        note = "Своё расписание важнее общего расписания чата."
+
     await safe_edit(
         cb.message,
         f"⏰ <b>{title}</b>\n\n"
-        "1. Отметьте дни недели, когда присылать отчёт.\n"
-        "2. Нажмите «Далее», чтобы выбрать время.\n\n"
-        f"Выбрано: {reports.format_days(mask)}\n"
-        f"Часовой пояс чата: {config.tz_label(chat['tz'])}",
-        keyboards.kb_days(scope, mask),
+        f"Сейчас: <b>{current or 'не задано'}</b>\n"
+        f"Часовой пояс чата: {config.tz_label(chat['tz'])}\n"
+        f"{note}\n\n"
+        "Расписание задаётся <b>текстом</b>: сначала дни недели, потом время.\n"
+        "Например: <code>вт, ср, чт</code> → <code>18:32</code>\n"
+        "Годятся и <code>пн-пт</code>, <code>будни</code>, <code>каждый день</code>.\n\n"
+        "Нажмите «Задать расписание» — я спрошу и подскажу примеры.",
+        keyboards.kb_schedule(scope, has_override),
     )
-
-
-@router.callback_query(F.data.startswith("sdt:"))
-async def cb_day_toggle(cb: CallbackQuery):
-    await cb.answer()
-    try:
-        _, scope, mask, day = cb.data.split(":")
-        mask, day = int(mask), int(day)
-    except (ValueError, IndexError):
-        await render_menu(cb)
-        return
-    await render_days(cb, scope, mask ^ (1 << day))
-
-
-@router.callback_query(F.data.startswith("sda:"))
-async def cb_day_all(cb: CallbackQuery):
-    await cb.answer()
-    try:
-        _, scope, mask = cb.data.split(":")
-        mask = int(mask)
-    except (ValueError, IndexError):
-        await render_menu(cb)
-        return
-    await render_days(cb, scope, 0 if mask >= 127 else 127)
 
 
 @router.callback_query(F.data.startswith("sd:"))
-async def cb_days(cb: CallbackQuery):
+async def cb_schedule(cb: CallbackQuery):
     await cb.answer()
-    try:
-        _, scope, mask = cb.data.split(":")
-        mask = int(mask)
-    except (ValueError, IndexError):
-        await render_menu(cb)
-        return
-    await render_days(cb, scope, mask)
-
-
-@router.callback_query(F.data.startswith("shp:"))
-async def cb_hour_picked(cb: CallbackQuery):
-    await cb.answer()
-    try:
-        _, scope, mask, hour = cb.data.split(":")
-        mask, hour = int(mask), int(hour)
-    except (ValueError, IndexError):
-        await render_menu(cb)
-        return
-    await safe_edit(
-        cb.message,
-        f"⏰ Час: <b>{hour:02d}</b>. Теперь выберите минуты:",
-        keyboards.kb_minutes(scope, mask, hour),
-    )
-
-
-@router.callback_query(F.data.startswith("sh:"))
-async def cb_hours(cb: CallbackQuery):
-    try:
-        _, scope, mask = cb.data.split(":")
-        mask = int(mask)
-    except (ValueError, IndexError):
-        await cb.answer()
-        await render_menu(cb)
-        return
-    if mask == 0:
-        await cb.answer("Сначала отметьте хотя бы один день.", show_alert=True)
-        return
-    await cb.answer()
-    chat = db.get_chat(cb.message.chat.id)
-    await safe_edit(
-        cb.message,
-        f"⏰ Выберите час отправки (пояс чата: {config.tz_label(chat['tz'])}):",
-        keyboards.kb_hours(scope, mask),
-    )
-
-
-@router.callback_query(F.data.startswith("sm:"))
-async def cb_save_schedule(cb: CallbackQuery):
-    try:
-        _, scope, mask, hour, minute = cb.data.split(":")
-        mask, hour, minute = int(mask), int(hour), int(minute)
-    except (ValueError, IndexError):
-        await cb.answer()
-        await render_menu(cb)
-        return
-    if mask <= 0 or not (0 <= hour <= 23) or not (0 <= minute <= 59):
-        await cb.answer("Что-то пошло не так, начните заново.", show_alert=True)
-        await render_menu(cb)
-        return
-    send_time = f"{hour:02d}:{minute:02d}"
-    chat_id = cb.message.chat.id
-    db.get_chat(chat_id)
-    if scope == "c":
-        db.set_chat_schedule(chat_id, mask, send_time)
-        label = "общее для чата"
-    else:
-        _, ev = _scope_event(cb, scope)
-        if ev is None:
-            await cb.answer("Этого мероприятия уже нет в чате.", show_alert=True)
-            await render_menu(cb)
-            return
-        db.set_event_schedule(chat_id, int(scope), mask, send_time)
-        name = ev["name"] or f"Мероприятие {scope}"
-        label = f"для «{html.escape(name)}»"
-    await cb.answer("Расписание сохранено")
-    await safe_edit(
-        cb.message,
-        f"✅ Расписание сохранено ({label}):\n"
-        f"<b>{reports.format_days(mask)} в {send_time}</b>",
-        keyboards.kb_after_schedule(scope),
-    )
+    parts = cb.data.split(":")
+    scope = parts[1] if len(parts) > 1 else "c"
+    await render_schedule(cb, scope)
 
 
 @router.callback_query(F.data.startswith("scl"))
@@ -750,17 +825,22 @@ async def cb_clear_schedule(cb: CallbackQuery):
 
 @router.callback_query(F.data == "fc")
 async def cb_flow_cancel(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
     await state.clear()
+    if data.get("prompt_id"):
+        await cleanup.delete_now(cb.bot, cb.message.chat.id, data["prompt_id"])
     await cb.answer()
     await render_menu(cb)
 
 
 @router.callback_query(F.data == "fs")
-async def cb_flow_stay(cb: CallbackQuery):
+async def cb_flow_stay(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
+    what = _WAITING_HINTS.get(await state.get_state() or "", "завершите текущее действие.")
     await safe_edit(
         cb.message,
-        "Хорошо, продолжаем. Отправьте ID мероприятия ответом на моё сообщение выше.",
+        f"Хорошо, продолжаем. Сейчас нужно: {what}\n"
+        "Ответьте на моё сообщение выше.",
     )
 
 

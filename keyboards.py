@@ -15,12 +15,8 @@
   add:{стр}               — добавить мероприятие (список из QTickets)
   pick:{id}               — выбрать мероприятие из списка
   man                     — ввести ID мероприятия вручную
-  sd:{scope}:{mask}       — выбор дней (scope: c = общее для чата, число = ID мероприятия)
-  sdt:{scope}:{mask}:{d}  — переключить день недели
-  sda:{scope}:{mask}      — отметить все дни / снять все
-  sh:{scope}:{mask}       — выбор часа
-  shp:{scope}:{mask}:{h}  — выбор минут
-  sm:{scope}:{mask}:{h}:{m} — сохранить расписание
+  sd:{scope}              — экран расписания (scope: c = общее для чата, число = ID мероприятия)
+  tw:{scope}              — задать расписание текстом (дни, потом время)
   scl:{scope}             — очистить расписание (для мероприятия = вернуть общее)
   fc / fs                 — «в главное меню» / «остаться и доделать»
   x                       — закрыть меню (убрать его из чата)
@@ -56,7 +52,7 @@ def kb_main(chat_row, n_events: int) -> InlineKeyboardMarkup:
             [_btn("📊 Отчёт за сегодня", "rep")],
             [_btn(f"🎭 Мероприятия ({n_events})", "evl:0")],
             [_btn("➕ Добавить мероприятие", "add:0")],
-            [_btn("⏰ Общее расписание", f"sd:c:{chat_row['days_mask'] or 0}")],
+            [_btn("⏰ Общее расписание", "sd:c")],
             [_btn(ntf_text, "ntf")],
             [_btn("🌍 Часовой пояс", "tz")],
             [_btn("✖️ Закрыть", "x")],
@@ -90,7 +86,7 @@ def kb_events_list(events: list, page: int) -> InlineKeyboardMarkup:
 
 def kb_event_card(event_row, has_override: bool) -> InlineKeyboardMarkup:
     ev_id = event_row["event_id"]
-    rows = [[_btn("⏰ Своё расписание", f"sd:{ev_id}:{event_row['days_mask'] or 0}")]]
+    rows = [[_btn("⏰ Своё расписание", f"sd:{ev_id}")]]
     if has_override:
         rows.append([_btn("♻️ Вернуть общее расписание", f"scl:{ev_id}")])
     rows.append([_btn("🗑 Удалить из чата", f"evd:{ev_id}")])
@@ -142,7 +138,7 @@ def kb_add_fallback() -> InlineKeyboardMarkup:
 def kb_after_add(event_id: int) -> InlineKeyboardMarkup:
     return _kb(
         [
-            [_btn("⏰ Задать своё расписание", f"sd:{event_id}:0")],
+            [_btn("⏰ Задать своё расписание", f"sd:{event_id}")],
             [_btn("🏠 Меню", "m")],
         ]
     )
@@ -154,45 +150,14 @@ def _back_cb(scope: str) -> str:
     return "m" if scope == "c" else f"evc:{scope}"
 
 
-def kb_days(scope: str, mask: int) -> InlineKeyboardMarkup:
-    day_buttons = []
-    for i, name in enumerate(DAY_NAMES):
-        mark = "✅ " if (mask >> i) & 1 else ""
-        day_buttons.append(_btn(f"{mark}{name}", f"sdt:{scope}:{mask}:{i}"))
-    rows = [day_buttons[:4], day_buttons[4:]]
-
-    all_text = "Снять все дни" if mask >= 127 else "Каждый день"
-    rows.append([_btn(all_text, f"sda:{scope}:{mask}")])
-    rows.append([_btn("Далее: выбрать время →", f"sh:{scope}:{mask}")])
+def kb_schedule(scope: str, has_override: bool) -> InlineKeyboardMarkup:
+    """Экран расписания: задать текстом, очистить, назад."""
+    rows = [[_btn("✍️ Задать расписание", f"tw:{scope}")]]
     if scope == "c":
         rows.append([_btn("🚫 Очистить общее расписание", "scl:c")])
-    else:
+    elif has_override:
         rows.append([_btn("♻️ Вернуть общее расписание", f"scl:{scope}")])
     rows.append([_btn("⬅️ Назад", _back_cb(scope))])
-    return _kb(rows)
-
-
-def kb_hours(scope: str, mask: int) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
-    for h in range(24):
-        row.append(_btn(f"{h:02d}", f"shp:{scope}:{mask}:{h}"))
-        if len(row) == 6:
-            rows.append(row)
-            row = []
-    rows.append([_btn("⬅️ К дням", f"sd:{scope}:{mask}")])
-    return _kb(rows)
-
-
-def kb_minutes(scope: str, mask: int, hour: int) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
-    for m in range(0, 60, 5):
-        row.append(_btn(f":{m:02d}", f"sm:{scope}:{mask}:{hour}:{m}"))
-        if len(row) == 4:
-            rows.append(row)
-            row = []
-    rows.append([_btn("⬅️ К часам", f"sh:{scope}:{mask}")])
     return _kb(rows)
 
 
