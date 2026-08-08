@@ -279,11 +279,8 @@ async def got_event_id(message: Message, state: FSMContext):
     data = await state.get_data()
     prompt_id = data.get("prompt_id")
     in_group = message.chat.type != "private"
-    if in_group:
-        # В группе принимаем только ответ на наше сообщение-приглашение —
-        # так работает даже при включённом «режиме конфиденциальности» бота.
-        if not message.reply_to_message or message.reply_to_message.message_id != prompt_id:
-            return
+    if not _is_reply_to_prompt(message, prompt_id):
+        return
 
     text = (message.text or "").strip()
     if text.startswith("/"):
@@ -335,22 +332,48 @@ async def got_event_id(message: Message, state: FSMContext):
 
 # ---------- Ввод расписания текстом ----------
 
-async def _ask(message: Message, text: str, placeholder: str) -> int:
-    """Задать вопрос с подсказкой и полем для ответа. Вернуть номер сообщения."""
+async def _ask(message: Message, text: str, placeholder: str, user=None) -> int:
+    """Задать вопрос с полем для ответа. Вернуть номер своего сообщения.
+
+    Тонкость Телеграма: если у поля ответа стоит пометка «только для
+    определённых людей» (selective), оно показывается лишь тем, кто упомянут
+    в тексте сообщения. Без упоминания поле не покажется НИКОМУ — из-за этого
+    вопрос выглядел как «кнопка не работает». Поэтому:
+    в личной переписке пометку не ставим вовсе, а в группе ставим только
+    вместе с упоминанием собеседника.
+    """
+    prefix = ""
+    selective = None
+    if message.chat.type != "private" and user is not None:
+        if user.username:
+            prefix = f"@{user.username}, "
+            selective = True
+        else:
+            prefix = f'<a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>, '
+
     prompt = await message.answer(
-        text,
-        reply_markup=ForceReply(selective=True, input_field_placeholder=placeholder),
+        prefix + text,
+        reply_markup=ForceReply(
+            selective=selective, input_field_placeholder=placeholder
+        ),
     )
     cleanup.schedule(message.bot, message.chat.id, prompt.message_id, cleanup.MENU_LIFETIME)
     return prompt.message_id
 
 
 def _is_reply_to_prompt(message: Message, prompt_id) -> bool:
-    """В группе принимаем только ответ на наше сообщение — так работает
+    """В группе принимаем ответ на наше сообщение — так вопрос работает
     даже при включённом «режиме конфиденциальности» бота."""
     if message.chat.type == "private":
         return True
-    return bool(message.reply_to_message) and message.reply_to_message.message_id == prompt_id
+    reply = message.reply_to_message
+    if reply is None:
+        return False
+    if reply.message_id == prompt_id:
+        return True
+    # Запасной вариант: ответ на любое наше сообщение тоже принимаем —
+    # например, если приглашение успело исчезнуть и было задано заново.
+    return bool(reply.from_user and reply.from_user.is_bot)
 
 
 @router.message(ScheduleInput.waiting_time)
@@ -658,15 +681,16 @@ async def cb_pick(cb: CallbackQuery):
 @router.callback_query(F.data == "man")
 async def cb_manual(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
-    prompt = await cb.message.answer(
-        "Отправьте числовой ID мероприятия из QTickets — ответом на это сообщение.\n"
-        "ID можно посмотреть в личном кабинете QTickets в адресной строке "
-        "страницы мероприятия.",
-        reply_markup=ForceReply(selective=True, input_field_placeholder="ID мероприятия"),
+    prompt_id = await _ask(
+        cb.message,
+        "🔢 <b>Отправьте ID мероприятия из QTickets</b> — ответом на это сообщение.\n\n"
+        "Это число из адресной строки страницы мероприятия в личном кабинете, "
+        "например <code>12345</code>.",
+        "ID мероприятия",
+        user=cb.from_user,
     )
-    cleanup.schedule(cb.bot, cb.message.chat.id, prompt.message_id, cleanup.MENU_LIFETIME)
     await state.set_state(AddEventState.waiting_id)
-    await state.update_data(prompt_id=prompt.message_id)
+    await state.update_data(prompt_id=prompt_id)
 
 
 # ---------- Кнопки: настройка расписания ----------
@@ -766,6 +790,7 @@ async def cb_ask_time(cb: CallbackQuery, state: FSMContext):
             days=reports.format_days(mask), tz=config.tz_label(chat["tz"])
         ),
         "18:32",
+        user=cb.from_user,
     )
     await state.set_state(ScheduleInput.waiting_time)
     await state.update_data(scope=scope, mask=mask, prompt_id=prompt_id)
