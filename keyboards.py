@@ -15,8 +15,10 @@
   add:{стр}               — добавить мероприятие (список из QTickets)
   pick:{id}               — выбрать мероприятие из списка
   man                     — ввести ID мероприятия вручную
-  sd:{scope}              — экран расписания (scope: c = общее для чата, число = ID мероприятия)
-  tw:{scope}              — задать расписание текстом (дни, потом время)
+  sd:{scope}              — выбор дней (scope: c = общее для чата, число = ID мероприятия)
+  sdt:{scope}:{mask}:{d}  — переключить день недели
+  sda:{scope}:{mask}      — отметить все дни / снять все
+  sh:{scope}:{mask}       — перейти к вводу времени (текстом)
   scl:{scope}             — очистить расписание (для мероприятия = вернуть общее)
   fc / fs                 — «в главное меню» / «остаться и доделать»
   x                       — закрыть меню (убрать его из чата)
@@ -150,12 +152,20 @@ def _back_cb(scope: str) -> str:
     return "m" if scope == "c" else f"evc:{scope}"
 
 
-def kb_schedule(scope: str, has_override: bool) -> InlineKeyboardMarkup:
-    """Экран расписания: задать текстом, очистить, назад."""
-    rows = [[_btn("✍️ Задать расписание", f"tw:{scope}")]]
+def kb_days(scope: str, mask: int) -> InlineKeyboardMarkup:
+    """Отметки дней недели + переход к вводу времени."""
+    day_buttons = []
+    for i, name in enumerate(DAY_NAMES):
+        mark = "✅ " if (mask >> i) & 1 else ""
+        day_buttons.append(_btn(f"{mark}{name}", f"sdt:{scope}:{mask}:{i}"))
+    rows = [day_buttons[:4], day_buttons[4:]]
+
+    all_text = "Снять все дни" if mask >= 127 else "Каждый день"
+    rows.append([_btn(all_text, f"sda:{scope}:{mask}")])
+    rows.append([_btn("Далее: время →", f"sh:{scope}:{mask}")])
     if scope == "c":
         rows.append([_btn("🚫 Очистить общее расписание", "scl:c")])
-    elif has_override:
+    else:
         rows.append([_btn("♻️ Вернуть общее расписание", f"scl:{scope}")])
     rows.append([_btn("⬅️ Назад", _back_cb(scope))])
     return _kb(rows)
