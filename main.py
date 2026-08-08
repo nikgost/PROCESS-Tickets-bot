@@ -58,8 +58,13 @@ async def main() -> None:
     me = await bot.get_me()
     log.info("Запущен бот @%s (id %s)", me.username, me.id)
 
-    asyncio.create_task(scheduler.run(bot))
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    # Ссылку на задачу держим в переменной: иначе сборщик мусора Python
+    # вправе убрать её вместе с планировщиком уведомлений.
+    scheduler_task = asyncio.create_task(scheduler.run(bot))
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        scheduler_task.cancel()
 
 
 if __name__ == "__main__":

@@ -180,6 +180,17 @@ def sent_exists(chat_id: int, event_id: int, local_date: str, hhmm: str) -> bool
     )
 
 
+def sent_any_today(chat_id: int, event_id: int, local_date: str) -> bool:
+    """Уходил ли сегодня отчёт по этому мероприятию — в любое время."""
+    return (
+        _q1(
+            "SELECT 1 FROM sent_log WHERE chat_id=? AND event_id=? AND local_date=?",
+            (chat_id, event_id, local_date),
+        )
+        is not None
+    )
+
+
 def sent_add(chat_id: int, event_id: int, local_date: str, hhmm: str) -> None:
     _exec(
         "INSERT OR IGNORE INTO sent_log(chat_id, event_id, local_date, hhmm) VALUES(?,?,?,?)",

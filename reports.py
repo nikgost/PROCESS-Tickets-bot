@@ -88,6 +88,47 @@ def parse_days(text: str) -> tuple[int | None, str | None]:
     return (mask or None), None
 
 
+def rotate_days(mask: int, shift: int) -> int:
+    """Сдвинуть отмеченные дни недели на shift дней (при переходе через полночь)."""
+    if not mask or shift % 7 == 0:
+        return mask
+    result = 0
+    for day in range(7):
+        if (mask >> day) & 1:
+            result |= 1 << ((day + shift) % 7)
+    return result
+
+
+def shift_schedule(
+    mask: int | None,
+    send_time: str | None,
+    old_tz: str,
+    new_tz: str,
+) -> tuple[int | None, str | None]:
+    """Пересчитать расписание при смене часового пояса чата.
+
+    Момент отправки остаётся тем же самым: 13:05 по Москве — это 15:05 по
+    Екатеринбургу. Если при пересчёте время перешло через полночь, дни недели
+    сдвигаются вместе с ним.
+    """
+    if not mask or not send_time or old_tz == new_tz:
+        return mask, send_time
+    try:
+        old_zone, new_zone = ZoneInfo(old_tz), ZoneInfo(new_tz)
+    except Exception:
+        return mask, send_time
+    try:
+        hour, minute = (int(part) for part in send_time.split(":"))
+    except ValueError:
+        return mask, send_time
+
+    today = datetime.now(old_zone).date()
+    was = datetime(today.year, today.month, today.day, hour, minute, tzinfo=old_zone)
+    now_local = was.astimezone(new_zone)
+    day_shift = (now_local.date() - was.date()).days
+    return rotate_days(mask, day_shift), now_local.strftime("%H:%M")
+
+
 def parse_time(text: str) -> str | None:
     """Разобрать время из «18:32», «18.32», «1832», «18 32», «9» и т. п."""
     if not text:

@@ -4,6 +4,8 @@ from __future__ import annotations  # чтобы код работал и на P
 
 import html
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -135,6 +137,16 @@ async def run_report(bot: Bot, chat_id: int) -> None:
     await safe_edit(note, text, ephemeral=False)
 
 
+async def _drop(message: Message) -> None:
+    """Убрать сообщение собеседника — команду или ответ на вопрос бота.
+
+    В личной переписке Телеграм это разрешает всегда. В группе — только если
+    бот администратор; если прав нет, сообщение просто останется, и это
+    не ошибка.
+    """
+    await cleanup.delete_now(message.bot, message.chat.id, message.message_id)
+
+
 def _chat_title(message: Message) -> str:
     if message.chat.title:
         return message.chat.title
@@ -239,6 +251,7 @@ async def cmd_menu(message: Message, state: FSMContext):
         if message.chat.type == "private":
             await message.answer("Это личный бот, доступ к нему ограничен.")
         return
+    await _drop(message)
     current = await state.get_state()
     if current:
         await message.answer(
@@ -259,6 +272,7 @@ async def cmd_report(message: Message):
         if message.chat.type == "private":
             await message.answer("Это личный бот, доступ к нему ограничен.")
         return
+    await _drop(message)
     db.get_chat(message.chat.id, _chat_title(message))
     await run_report(message.bot, message.chat.id)
 
@@ -267,7 +281,9 @@ async def cmd_report(message: Message):
 async def cmd_help(message: Message):
     if not config.is_owner(message.from_user.id if message.from_user else None):
         return
-    await message.answer(HELP_TEXT)
+    await _drop(message)
+    help_msg = await message.answer(HELP_TEXT)
+    cleanup.schedule(message.bot, message.chat.id, help_msg.message_id, cleanup.MENU_LIFETIME)
 
 
 # ---------- Ввод ID мероприятия вручную ----------
@@ -314,6 +330,7 @@ async def got_event_id(message: Message, state: FSMContext):
     await state.clear()
     if prompt_id:
         await cleanup.delete_now(message.bot, message.chat.id, prompt_id)
+    await _drop(message)
     added = db.add_event(message.chat.id, event_id, info["name"])
     if added:
         await safe_edit(
@@ -368,11 +385,14 @@ def _is_reply_to_prompt(message: Message, prompt_id) -> bool:
         return True
     reply = message.reply_to_message
     if reply is None:
-        return False
+        # Обычное сообщение в группе бот получает только если у него выключен
+        # «режим конфиденциальности». Раз уж получили — принимаем: вопрос задан,
+        # спрашивающий проверен, ждать именно ответа-цитаты незачем.
+        return True
     if reply.message_id == prompt_id:
         return True
-    # Запасной вариант: ответ на любое наше сообщение тоже принимаем —
-    # например, если приглашение успело исчезнуть и было задано заново.
+    # Ответ на любое другое наше сообщение тоже подходит: приглашение могло
+    # исчезнуть и быть задано заново.
     return bool(reply.from_user and reply.from_user.is_bot)
 
 
@@ -420,6 +440,7 @@ async def got_time_text(message: Message, state: FSMContext):
 
     if data.get("prompt_id"):
         await cleanup.delete_now(message.bot, chat_id, data["prompt_id"])
+    await _drop(message)
     await state.clear()
 
     done = await message.answer(
@@ -497,6 +518,69 @@ async def cb_tz(cb: CallbackQuery):
     )
 
 
+def _retime_schedules(chat_id: int, old_tz: str, new_tz: str) -> list:
+    """Перевести все расписания чата в новый часовой пояс.
+
+    Момент отправки сохраняется: 13:05 по Москве становится 15:05 по
+    Екатеринбургу. Заодно помечаем в журнале уже отправленные сегодня отчёты
+    под новым временем, чтобы смена пояса не вызвала повторное уведомление.
+    """
+    if old_tz == new_tz:
+        return []
+
+    changes = []
+    chat = db.get_chat(chat_id)
+    new_mask, new_time = reports.shift_schedule(
+        chat["days_mask"], chat["send_time"], old_tz, new_tz
+    )
+    if new_time and new_time != chat["send_time"]:
+        db.set_chat_schedule(chat_id, new_mask, new_time)
+        changes.append(
+            (
+                "общее расписание чата",
+                reports.format_schedule(chat["days_mask"], chat["send_time"]),
+                reports.format_schedule(new_mask, new_time),
+            )
+        )
+
+    try:
+        today_new = datetime.now(ZoneInfo(new_tz)).date().isoformat()
+        today_old = datetime.now(ZoneInfo(old_tz)).date().isoformat()
+    except Exception:
+        today_new = today_old = None
+
+    for ev in db.get_events(chat_id):
+        if ev["days_mask"] and ev["send_time"]:
+            ev_mask, ev_time = reports.shift_schedule(
+                ev["days_mask"], ev["send_time"], old_tz, new_tz
+            )
+            if ev_time and ev_time != ev["send_time"]:
+                db.set_event_schedule(chat_id, ev["event_id"], ev_mask, ev_time)
+                name = ev["name"] or f"мероприятие {ev['event_id']}"
+                changes.append(
+                    (
+                        f"«{html.escape(name)}»",
+                        reports.format_schedule(ev["days_mask"], ev["send_time"]),
+                        reports.format_schedule(ev_mask, ev_time),
+                    )
+                )
+        # Защита от повторного уведомления в день смены пояса
+        if today_new and today_old:
+            already = db.sent_any_today(chat_id, ev["event_id"], today_old) or (
+                today_new != today_old
+                and db.sent_any_today(chat_id, ev["event_id"], today_new)
+            )
+            if already:
+                fresh = db.get_event(chat_id, ev["event_id"])
+                mask, send_time, _own = reports.effective_schedule(
+                    fresh, db.get_chat(chat_id)
+                )
+                if send_time:
+                    db.sent_add(chat_id, ev["event_id"], today_new, send_time)
+
+    return changes
+
+
 @router.callback_query(F.data.startswith("tzs:"))
 async def cb_tz_set(cb: CallbackQuery):
     try:
@@ -505,10 +589,28 @@ async def cb_tz_set(cb: CallbackQuery):
     except (ValueError, IndexError):
         await cb.answer("Кнопка устарела. Откройте меню заново: /menu", show_alert=True)
         return
-    db.get_chat(cb.message.chat.id)
-    db.set_tz(cb.message.chat.id, tz_name)
-    await cb.answer(f"Сохранено: {tz_lbl}")
-    await render_menu(cb)
+    chat_id = cb.message.chat.id
+    chat = db.get_chat(chat_id)
+    old_tz = chat["tz"] or config.DEFAULT_TZ
+    changes = _retime_schedules(chat_id, old_tz, tz_name)
+    db.set_tz(chat_id, tz_name)
+
+    if changes:
+        await cb.answer(f"Сохранено: {tz_lbl}")
+        lines = "\n".join(
+            f"• {what}: <b>{was}</b> → <b>{now}</b>" for what, was, now in changes
+        )
+        await safe_edit(
+            cb.message,
+            f"🌍 Часовой пояс чата: <b>{html.escape(tz_lbl)}</b>\n\n"
+            "Время уведомлений пересчитано, чтобы отчёты приходили в тот же "
+            "момент, что и раньше:\n"
+            f"{lines}",
+            keyboards.kb_back_menu(),
+        )
+    else:
+        await cb.answer(f"Сохранено: {tz_lbl}")
+        await render_menu(cb)
 
 
 # ---------- Кнопки: список мероприятий чата ----------
