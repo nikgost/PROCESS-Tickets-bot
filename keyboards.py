@@ -23,6 +23,7 @@
   sm:{scope}:{mask}:{h}:{m} — сохранить расписание
   scl:{scope}             — очистить расписание (для мероприятия = вернуть общее)
   fc / fs                 — «в главное меню» / «остаться и доделать»
+  x                       — закрыть меню (убрать его из чата)
 """
 
 from __future__ import annotations  # чтобы код работал и на Python 3.9
@@ -58,6 +59,7 @@ def kb_main(chat_row, n_events: int) -> InlineKeyboardMarkup:
             [_btn("⏰ Общее расписание", f"sd:c:{chat_row['days_mask'] or 0}")],
             [_btn(ntf_text, "ntf")],
             [_btn("🌍 Часовой пояс", "tz")],
+            [_btn("✖️ Закрыть", "x")],
         ]
     )
 

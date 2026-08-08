@@ -12,6 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, ChatMemberUpdated, ForceReply, Message
 
+import cleanup
 import config
 import db
 import keyboards
@@ -50,13 +51,31 @@ class AddEventState(StatesGroup):
 
 # ---------- Вспомогательные ----------
 
-async def safe_edit(msg: Message, text: str, kb=None) -> None:
-    """Изменить сообщение; молча пропустить ошибку «текст не изменился»."""
+async def safe_edit(msg: Message, text: str, kb=None, ephemeral: bool = True) -> None:
+    """Изменить сообщение.
+
+    ephemeral=True (по умолчанию) — это служебный экран: после правки заново
+    заводим отсчёт до его уборки. ephemeral=False — сообщение остаётся в чате
+    навсегда (так помечены отчёты о билетах).
+
+    Ошибки «текст не изменился» и «сообщение не найдено» пропускаем молча:
+    экран мог быть уже убран или удалён вручную.
+    """
     try:
         await msg.edit_text(text, reply_markup=kb)
     except TelegramBadRequest as e:
-        if "message is not modified" not in str(e).lower():
+        text_err = str(e).lower()
+        if "message is not modified" in text_err:
+            pass
+        elif "message to edit not found" in text_err or "message can't be edited" in text_err:
+            cleanup.forget_menu(msg.chat.id, msg.message_id)
+            return
+        else:
             raise
+    if ephemeral:
+        cleanup.schedule(msg.bot, msg.chat.id, msg.message_id)
+    else:
+        cleanup.forget_menu(msg.chat.id, msg.message_id)
 
 
 def menu_text(chat_row) -> str:
@@ -88,7 +107,8 @@ async def run_report(bot: Bot, chat_id: int) -> None:
     except Exception as e:
         log.exception("Сбой отчёта в чате %s", chat_id)
         text = f"⚠️ Не получилось собрать отчёт: {html.escape(str(e))}"
-    await safe_edit(note, text)
+    # Отчёт — это не служебное сообщение, он остаётся в чате.
+    await safe_edit(note, text, ephemeral=False)
 
 
 def _chat_title(message: Message) -> str:
@@ -161,11 +181,12 @@ async def on_membership(update: ChatMemberUpdated, bot: Bot):
             return
         db.get_chat(chat.id, chat.title or "Чат")
         try:
-            await bot.send_message(
+            hello = await bot.send_message(
                 chat.id,
                 "Привет! Я буду присылать сюда отчёты о купленных билетах.\n"
                 "Откройте меню: /menu",
             )
+            cleanup.schedule(bot, chat.id, hello.message_id, cleanup.NOTICE_LIFETIME)
         except Exception:
             pass
         return
@@ -198,9 +219,10 @@ async def cmd_menu(message: Message, state: FSMContext):
         await message.answer(CONFIRM_FLOW_TEXT, reply_markup=keyboards.kb_flow_confirm())
         return
     chat = db.get_chat(message.chat.id, _chat_title(message))
-    await message.answer(
+    sent = await message.answer(
         menu_text(chat), reply_markup=keyboards.kb_main(chat, db.count_events(chat["chat_id"]))
     )
+    await cleanup.register_menu(message.bot, message.chat.id, sent.message_id)
 
 
 @router.message(Command("report"))
@@ -266,6 +288,8 @@ async def got_event_id(message: Message, state: FSMContext):
         return
 
     await state.clear()
+    if prompt_id:
+        await cleanup.delete_now(message.bot, message.chat.id, prompt_id)
     added = db.add_event(message.chat.id, event_id, info["name"])
     if added:
         await safe_edit(
@@ -289,12 +313,14 @@ async def private_text(message: Message, state: FSMContext):
         return
     if (message.text or "").strip().lower() in ("старт", "меню", "start", "menu"):
         chat = db.get_chat(message.chat.id, _chat_title(message))
-        await message.answer(
+        sent = await message.answer(
             menu_text(chat),
             reply_markup=keyboards.kb_main(chat, db.count_events(chat["chat_id"])),
         )
+        await cleanup.register_menu(message.bot, message.chat.id, sent.message_id)
         return
-    await message.answer("Откройте меню командой /menu")
+    hint = await message.answer("Откройте меню командой /menu")
+    cleanup.schedule(message.bot, message.chat.id, hint.message_id, cleanup.NOTICE_LIFETIME)
 
 
 # ---------- Кнопки: базовые ----------
@@ -303,6 +329,13 @@ async def private_text(message: Message, state: FSMContext):
 async def cb_menu(cb: CallbackQuery):
     await cb.answer()
     await render_menu(cb)
+
+
+@router.callback_query(F.data == "x")
+async def cb_close(cb: CallbackQuery):
+    await cb.answer("Меню закрыто")
+    await cleanup.delete_now(cb.bot, cb.message.chat.id, cb.message.message_id)
+    cleanup.forget_menu(cb.message.chat.id, cb.message.message_id)
 
 
 @router.callback_query(F.data == "noop")
@@ -530,6 +563,7 @@ async def cb_manual(cb: CallbackQuery, state: FSMContext):
         "страницы мероприятия.",
         reply_markup=ForceReply(selective=True, input_field_placeholder="ID мероприятия"),
     )
+    cleanup.schedule(cb.bot, cb.message.chat.id, prompt.message_id, cleanup.MENU_LIFETIME)
     await state.set_state(AddEventState.waiting_id)
     await state.update_data(prompt_id=prompt.message_id)
 
