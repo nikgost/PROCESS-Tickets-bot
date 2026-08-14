@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
+import cleanup
 import config
 import db
 import qtickets
@@ -34,6 +35,12 @@ async def run(bot: Bot) -> None:
             await _tick(bot)
         except Exception:
             log.exception("Сбой в планировщике")
+        try:
+            # Уборка служебных сообщений: очередь лежит в базе, поэтому
+            # переживает перезапуск бота.
+            await cleanup.run_due(bot)
+        except Exception:
+            log.exception("Сбой уборки служебных сообщений")
         try:
             today = datetime.now(timezone.utc).date()
             if last_cleanup_day != today:

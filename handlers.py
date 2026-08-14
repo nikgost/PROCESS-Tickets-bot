@@ -99,7 +99,7 @@ async def safe_edit(msg: Message, text: str, kb=None, ephemeral: bool = True) ->
         else:
             raise
     if ephemeral:
-        cleanup.schedule(msg.bot, msg.chat.id, msg.message_id)
+        cleanup.schedule(msg.chat.id, msg.message_id)
     else:
         cleanup.forget_menu(msg.chat.id, msg.message_id)
 
@@ -108,13 +108,21 @@ def menu_text(chat_row) -> str:
     n = db.count_events(chat_row["chat_id"])
     ntf = "✅ включены" if chat_row["enabled"] else "🔕 выключены"
     sched = reports.format_schedule(chat_row["days_mask"], chat_row["send_time"]) or "не задано"
-    return (
+    text = (
         "<b>Меню бота</b>\n\n"
         f"Уведомления: {ntf}\n"
         f"Часовой пояс: {config.tz_label(chat_row['tz'])}\n"
         f"Общее расписание: {sched}\n"
         f"Мероприятий в этом чате: {n}"
     )
+    if chat_row["chat_id"] in cleanup.no_delete_rights:
+        text += (
+            "\n\n⚠️ Ваши команды остаются в чате: у меня нет права удалять "
+            "чужие сообщения. Чтобы я убирал и их, сделайте меня "
+            "администратором с правом «Удаление сообщений». Свои сообщения "
+            "я убираю в любом случае."
+        )
+    return text
 
 
 async def render_menu(cb: CallbackQuery) -> None:
@@ -141,10 +149,17 @@ async def _drop(message: Message) -> None:
     """Убрать сообщение собеседника — команду или ответ на вопрос бота.
 
     В личной переписке Телеграм это разрешает всегда. В группе — только если
-    бот администратор; если прав нет, сообщение просто останется, и это
-    не ошибка.
+    бот администратор с правом «Удаление сообщений»; если права нет,
+    сообщение просто останется. Запоминаем это, чтобы подсказать в меню.
     """
-    await cleanup.delete_now(message.bot, message.chat.id, message.message_id)
+    chat_id = message.chat.id
+    ok = await cleanup.delete_now(message.bot, chat_id, message.message_id)
+    if message.chat.type == "private":
+        return
+    if ok:
+        cleanup.no_delete_rights.discard(chat_id)
+    else:
+        cleanup.no_delete_rights.add(chat_id)
 
 
 def _chat_title(message: Message) -> str:
@@ -222,7 +237,7 @@ async def on_membership(update: ChatMemberUpdated, bot: Bot):
                 "Привет! Я буду присылать сюда отчёты о купленных билетах.\n"
                 "Откройте меню: /menu",
             )
-            cleanup.schedule(bot, chat.id, hello.message_id, cleanup.NOTICE_LIFETIME)
+            cleanup.schedule(chat.id, hello.message_id, cleanup.NOTICE_LIFETIME)
         except Exception:
             pass
         return
@@ -283,7 +298,7 @@ async def cmd_help(message: Message):
         return
     await _drop(message)
     help_msg = await message.answer(HELP_TEXT)
-    cleanup.schedule(message.bot, message.chat.id, help_msg.message_id, cleanup.MENU_LIFETIME)
+    cleanup.schedule(message.chat.id, help_msg.message_id, cleanup.MENU_LIFETIME)
 
 
 # ---------- Ввод ID мероприятия вручную ----------
@@ -374,7 +389,7 @@ async def _ask(message: Message, text: str, placeholder: str, user=None) -> int:
             selective=selective, input_field_placeholder=placeholder
         ),
     )
-    cleanup.schedule(message.bot, message.chat.id, prompt.message_id, cleanup.MENU_LIFETIME)
+    cleanup.schedule(message.chat.id, prompt.message_id, cleanup.MENU_LIFETIME)
     return prompt.message_id
 
 
@@ -448,7 +463,7 @@ async def got_time_text(message: Message, state: FSMContext):
         f"<b>{reports.format_days(mask)} в {send_time}</b>",
         reply_markup=keyboards.kb_after_schedule(scope),
     )
-    cleanup.schedule(message.bot, chat_id, done.message_id, cleanup.MENU_LIFETIME)
+    cleanup.schedule(chat_id, done.message_id, cleanup.MENU_LIFETIME)
 
 
 @router.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
@@ -465,7 +480,7 @@ async def private_text(message: Message, state: FSMContext):
         await cleanup.register_menu(message.bot, message.chat.id, sent.message_id)
         return
     hint = await message.answer("Откройте меню командой /menu")
-    cleanup.schedule(message.bot, message.chat.id, hint.message_id, cleanup.NOTICE_LIFETIME)
+    cleanup.schedule(message.chat.id, hint.message_id, cleanup.NOTICE_LIFETIME)
 
 
 # ---------- Кнопки: базовые ----------

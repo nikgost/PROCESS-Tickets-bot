@@ -4,6 +4,8 @@
   chats       — чаты, куда добавлен бот, и их общие настройки
   chat_events — мероприятия, привязанные к чату (и их личные расписания)
   sent_log    — журнал уже отправленных уведомлений (защита от повторов)
+  to_delete   — очередь служебных сообщений бота на удаление
+  live_menu   — какое сообщение сейчас служит меню в каждом чате
 """
 
 from __future__ import annotations  # чтобы код работал и на Python 3.9
@@ -37,6 +39,16 @@ CREATE TABLE IF NOT EXISTS sent_log (
     local_date TEXT NOT NULL,   -- дата по поясу чата, ГГГГ-ММ-ДД
     hhmm       TEXT NOT NULL,
     PRIMARY KEY (chat_id, event_id, local_date, hhmm)
+);
+CREATE TABLE IF NOT EXISTS to_delete (
+    chat_id    INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    delete_at  INTEGER NOT NULL,   -- когда убрать, время в секундах
+    PRIMARY KEY (chat_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS live_menu (
+    chat_id    INTEGER PRIMARY KEY,
+    message_id INTEGER NOT NULL
 );
 """
 
@@ -201,3 +213,53 @@ def sent_add(chat_id: int, event_id: int, local_date: str, hhmm: str) -> None:
 def sent_cleanup(days: int = 40) -> None:
     threshold = (date.today() - timedelta(days=days)).isoformat()
     _exec("DELETE FROM sent_log WHERE local_date < ?", (threshold,))
+
+
+# ---------- Очередь удаления служебных сообщений ----------
+
+def delete_plan(chat_id: int, message_id: int, delete_at: int) -> None:
+    """Поставить сообщение в очередь на удаление (или сдвинуть срок)."""
+    _exec(
+        "INSERT OR REPLACE INTO to_delete(chat_id, message_id, delete_at) VALUES(?,?,?)",
+        (chat_id, message_id, delete_at),
+    )
+
+
+def delete_forget(chat_id: int, message_id: int) -> None:
+    """Убрать сообщение из очереди — оно остаётся в чате навсегда."""
+    _exec(
+        "DELETE FROM to_delete WHERE chat_id=? AND message_id=?", (chat_id, message_id)
+    )
+
+
+def delete_due(now: int) -> list[sqlite3.Row]:
+    return _q("SELECT * FROM to_delete WHERE delete_at<=? ORDER BY delete_at", (now,))
+
+
+def delete_purge_old(before: int) -> None:
+    """Телеграм не даёт удалять сообщения старше 48 часов — такие просто забываем."""
+    _exec("DELETE FROM to_delete WHERE delete_at < ?", (before,))
+
+
+# ---------- Живое меню чата ----------
+
+def menu_get(chat_id: int) -> int | None:
+    row = _q1("SELECT message_id FROM live_menu WHERE chat_id=?", (chat_id,))
+    return row["message_id"] if row else None
+
+
+def menu_set(chat_id: int, message_id: int) -> None:
+    _exec(
+        "INSERT OR REPLACE INTO live_menu(chat_id, message_id) VALUES(?,?)",
+        (chat_id, message_id),
+    )
+
+
+def menu_clear(chat_id: int, message_id: int | None = None) -> None:
+    if message_id is None:
+        _exec("DELETE FROM live_menu WHERE chat_id=?", (chat_id,))
+    else:
+        _exec(
+            "DELETE FROM live_menu WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id),
+        )
