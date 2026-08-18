@@ -4,6 +4,7 @@ from __future__ import annotations  # чтобы код работал и на P
 
 import html
 import logging
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -158,6 +159,37 @@ def parse_time(text: str) -> str | None:
     return f"{hour:02d}:{minute:02d}"
 
 
+# Городская пометка в конце названия: «(Екб)», «[Пермь]» и тому подобное.
+# Длину содержимого ограничиваем, чтобы не срезать осмысленный подзаголовок
+# вроде «(концерт в двух отделениях)» — в любое название города это влезает
+# с запасом («Нижний Новгород» — 15 знаков).
+_CITY_TAG = re.compile(r"\s*[\(\[]([^()\[\]]{1,24})[\)\]]\s*$")
+
+
+def display_name(name: str) -> str:
+    """Название спектакля для сообщения — без городской пометки в конце.
+
+    «Леопарды Килиманджаро (Екб)» → «Леопарды Килиманджаро».
+    Работает для любого города: убирается сама скобка в конце, а не список
+    заранее известных городов. Если после этого от названия ничего не
+    останется, возвращаем его как было — лучше с пометкой, чем пустым.
+
+    Полное название при этом никуда не девается: в меню, в списке добавления
+    и в карточке мероприятия оно показывается целиком, иначе одноимённые
+    спектакли разных городов стало бы не различить.
+    """
+    cleaned = (name or "").strip()
+    while True:
+        match = _CITY_TAG.search(cleaned)
+        if match is None:
+            break
+        candidate = cleaned[: match.start()].strip()
+        if not candidate:
+            break
+        cleaned = candidate
+    return cleaned or (name or "").strip()
+
+
 def format_days(mask: int | None) -> str:
     if not mask:
         return "—"
@@ -273,7 +305,8 @@ async def build_report(
             name = ev["name"] or f"Мероприятие {ev['event_id']}"
             block = "⚠️ Внутренняя ошибка при сборке отчёта. Подробности в журнале бота."
 
-        parts.append(f"<b>{html.escape(str(name))}</b>\n{html.escape(block)}")
+        title = display_name(str(name))
+        parts.append(f"<b>{html.escape(title)}</b>\n{html.escape(block)}")
 
     result = "\n\n".join(parts)
     if len(result) > 4000:  # предел Телеграма на одно сообщение — 4096 знаков
