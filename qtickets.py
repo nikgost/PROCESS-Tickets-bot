@@ -155,6 +155,8 @@ class QTicketsClient:
                 continue
             if s.get("is_active") in (0, False, "0"):
                 continue  # выключенные (отменённые) сеансы не считаем
+            if s.get("deleted_at"):
+                continue  # удалённые сеансы тоже не считаем
             shows.append({"id": int(s["id"]), "start": start})
         return {
             "id": int(data["id"]),
