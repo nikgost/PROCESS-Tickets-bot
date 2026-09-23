@@ -246,7 +246,7 @@ async def event_report_block(
     if not todays:
         return info["name"], "Сегодня сеансов нет."
 
-    counts = await qt.count_paid_tickets(event_id, {t["id"] for t in todays})
+    counts = await qt.count_tickets(event_id, {t["id"] for t in todays})
     total = sum(counts.values())
     if total == 0:
         return info["name"], "На сегодня куплено билетов: 0"
@@ -272,6 +272,13 @@ async def build_report(
 
     Перед строками с билетами всегда ставится название мероприятия
     (жирным). Ошибка по одному мероприятию не ломает отчёт по остальным.
+
+    Сообщение начинается с пустой строки. Это не опечатка: в push-уведомлении
+    группового чата Телеграм сам подставляет «Имя бота: » перед текстом
+    сообщения. Без пустой строки эта подпись прилипает к первому слову
+    названия спектакля и ломает перенос («PROCESS Билеты: Леопарды» /
+    «Килиманджаро»). Пустая строка отделяет подпись от названия, и оно
+    начинается с новой строки в уведомлении.
     """
     if not events:
         return (
@@ -306,7 +313,8 @@ async def build_report(
             block = "⚠️ Внутренняя ошибка при сборке отчёта. Подробности в журнале бота."
 
         title = display_name(str(name))
-        parts.append(f"<b>{html.escape(title)}</b>\n{html.escape(block)}")
+        lead = "\n" if not parts else ""  # см. пояснение ниже
+        parts.append(f"{lead}<b>{html.escape(title)}</b>\n{html.escape(block)}")
 
     result = "\n\n".join(parts)
     if len(result) > 4000:  # предел Телеграма на одно сообщение — 4096 знаков

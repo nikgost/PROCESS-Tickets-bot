@@ -60,6 +60,14 @@ class QTicketsClient:
         self._timeout = aiohttp.ClientTimeout(total=timeout_sec)
 
     async def _request(self, method: str, path: str, payload: dict | None = None):
+        # Предохранитель: бот только ЧИТАЕТ данные QTickets. Любой другой вид
+        # запроса — ошибка в коде, а не рабочая ситуация. Особенно важно для
+        # адреса со штрихкодами: запрос на запись по тому же адресу отмечает
+        # билеты как отсканированные на входе.
+        if method.upper() != "GET":
+            raise QTicketsError(f"Бот не должен изменять данные QTickets ({method} {path}).")
+        if "barcode" in path and payload is not None:
+            raise QTicketsError("Запрос штрихкодов отправляется без тела.")
         url = f"{self._base}/{path.lstrip('/')}"
         headers = {
             "Authorization": f"Bearer {self._token}",
@@ -166,10 +174,58 @@ class QTicketsClient:
 
     # ---------- Подсчёт билетов ----------
 
+    async def count_show_tickets(self, show_ids: set[int]) -> dict[int, int]:
+        """Сколько действующих билетов на каждом сеансе — как в кабинете QTickets.
+
+        Для каждого сеанса берём список его действующих штрихкодов
+        (GET /shows/{id}/barcodes). Один билет — один штрихкод, отменённые
+        и возвращённые туда не входят. Так бот видит все билеты сеанса,
+        как бы их ни оформили: оплатой, подарочным сертификатом, промокодом
+        на полную сумму, приглашением из кабинета.
+        """
+        counts: dict[int, int] = {}
+        for sid in sorted(int(x) for x in show_ids):
+            resp = await self._request("GET", f"shows/{sid}/barcodes")
+            if isinstance(resp, dict) and isinstance(resp.get("data"), list):
+                items = resp["data"]
+            elif isinstance(resp, list):
+                items = resp
+            else:
+                raise QTicketsError(f"Непонятный ответ QTickets по билетам сеанса {sid}.")
+            seen = set()
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                key = it.get("id") or it.get("barcode")
+                if key is None or key in seen:
+                    continue
+                seen.add(key)
+            counts[sid] = len(seen)
+        return counts
+
+    async def count_tickets(self, event_id: int, show_ids: set[int]) -> dict[int, int]:
+        """Главный подсчёт для отчёта.
+
+        Основной способ — по билетам сеанса (как в кабинете). Если QTickets
+        по какой-то причине не отдал их, считаем прежним способом — по
+        оплаченным заказам — и пишем об этом в журнал: отчёт всё равно уйдёт.
+        """
+        if not show_ids:
+            return {}
+        try:
+            return await self.count_show_tickets(show_ids)
+        except QTicketsError as e:
+            log.warning(
+                "Не удалось получить билеты по сеансам (%s) — считаю по заказам.", e
+            )
+            return await self.count_paid_tickets(event_id, show_ids)
+
     async def count_paid_tickets(
         self, event_id: int, show_ids: set[int]
     ) -> dict[int, int]:
-        """Сколько ОПЛАЧЕННЫХ билетов куплено на каждый из указанных сеансов.
+        """Запасной способ: оплаченные билеты по списку заказов мероприятия.
+
+        Используется, только если QTickets не отдал билеты по сеансам.
 
         Идём по списку заказов мероприятия (только оплаченные), внутри каждого
         заказа смотрим билеты: пропускаем удалённые и возвращённые, остальные

@@ -118,11 +118,105 @@ async def main() -> None:
         print(line)
 
     print()
-    if counted:
-        print(f"Бот считает сегодняшними сеансы: {counted}")
-        print("Поэтому в отчёте не «Сегодня сеансов нет», а число билетов.")
-    else:
+    if not counted:
         print("Сегодняшних сеансов нет — бот должен написать «Сегодня сеансов нет».")
+        return
+    print(f"Бот считает сегодняшними сеансы: {counted}")
+    await compare_counts(event_id, counted, rows)
+
+
+async def compare_counts(event_id: int, show_ids: list, rows: list) -> None:
+    """Сравнить два способа подсчёта и объяснить каждый расхождённый билет."""
+    client = qtickets.get_client()
+    times = {int(s["id"]): local for local, s in rows if local is not None}
+
+    # Способ бота сейчас: действующие билеты сеанса (как в кабинете QTickets)
+    by_show = {}
+    for sid in show_ids:
+        resp = await client._request("GET", f"shows/{sid}/barcodes")
+        items = resp.get("data") if isinstance(resp, dict) else resp
+        by_show[sid] = [it for it in (items or []) if isinstance(it, dict)]
+
+    # Прежний способ: оплаченные заказы. Заодно запоминаем, в каком заказе какой билет.
+    basket_order = {}
+    counted_old = set()
+    page, capped = 1, False
+    while True:
+        if page > 30:
+            capped = True
+            break
+        resp = await client._request("GET", "orders", {
+            "where": [{"column": "event_id", "value": int(event_id)}],
+            "orderBy": {"id": "desc"},
+            "page": page,
+        })
+        items, paging = client._data_list(resp)
+        if not items:
+            break
+        for order in items:
+            if not isinstance(order, dict):
+                continue
+            for b in order.get("baskets") or []:
+                if not isinstance(b, dict) or b.get("id") is None:
+                    continue
+                basket_order[int(b["id"])] = (order, b)
+                ok = (
+                    order.get("payed") and not order.get("deleted_at")
+                    and not b.get("deleted_at") and not b.get("refunded_at")
+                )
+                if ok:
+                    counted_old.add(int(b["id"]))
+        per_page = int(paging.get("perPage") or 100) if paging else 100
+        total = int(paging.get("total") or 0) if paging else 0
+        if (total and page * per_page >= total) or len(items) < per_page:
+            break
+        page += 1
+
+    print()
+    print("Сравнение по сегодняшним сеансам:")
+    print("  время   | в кабинете (так считает бот теперь) | по оплаченным заказам (как было)")
+    for sid in show_ids:
+        ids = {int(it["id"]) for it in by_show[sid] if it.get("id") is not None}
+        old_n = len(ids & counted_old)
+        t = times.get(sid)
+        print(f"  {t:%H:%M}   | {len(ids):^35} | {old_n:^10}" if t else f"  {sid} | {len(ids)} | {old_n}")
+
+    print()
+    lost = []
+    for sid in show_ids:
+        for it in by_show[sid]:
+            bid = it.get("id")
+            if bid is not None and int(bid) not in counted_old:
+                lost.append((sid, it))
+    if not lost:
+        print("Расхождений нет: оба способа видят одни и те же билеты.")
+        return
+
+    print(f"Билеты, которые прежний способ НЕ видел ({len(lost)} шт.), и почему:")
+    for sid, it in lost:
+        t = times.get(sid)
+        head = f"  {t:%H:%M}" if t else f"  сеанс {sid}"
+        pair = basket_order.get(int(it["id"]))
+        if pair is None:
+            print(f"{head}  билет {it['id']}: его заказа нет в списке заказов мероприятия"
+                  " — вероятно, продан через партнёра или оформлен в обход заказов")
+            continue
+        order, b = pair
+        reasons = []
+        if not order.get("payed"):
+            reasons.append("заказ не отмечен как оплаченный")
+        if order.get("promo_code_id"):
+            reasons.append(f"промокод/сертификат (promo_code_id={order.get('promo_code_id')})")
+        if order.get("discount_id"):
+            reasons.append(f"скидка (discount_id={order.get('discount_id')})")
+        if order.get("backend_user_id"):
+            reasons.append("оформлен из личного кабинета (приглашение/ручная выдача)")
+        if order.get("reserved"):
+            reasons.append("бессрочная бронь")
+        print(f"{head}  билет {it['id']}, заказ {order.get('id')}, цена {order.get('price')}: "
+              + ("; ".join(reasons) if reasons else "причина не видна по полям заказа"))
+    if capped:
+        print("  (просмотрены только последние заказы — для сегодняшних сеансов этого достаточно)")
 
 
 if __name__ == "__main__":
