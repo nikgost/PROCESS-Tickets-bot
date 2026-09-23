@@ -8,7 +8,8 @@
     cd /opt/PROCESS-Tickets-bot
     venv/bin/python check_event.py 186377
 
-Часовой пояс по умолчанию — екатеринбургский (он же пермский). Другой можно
+Часовой пояс берётся из настроек того чата, куда мероприятие добавлено в боте.
+Если мероприятие не добавлено ни в один чат — московский. Другой пояс можно
 указать вторым словом:
 
     venv/bin/python check_event.py 186377 Europe/Moscow
@@ -18,23 +19,43 @@ from __future__ import annotations  # чтобы код работал и на P
 
 import asyncio
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import config
 import qtickets
 
-DEFAULT_TZ = "Asia/Yekaterinburg"
+DEFAULT_TZ = "Europe/Moscow"
 
 
 def _fmt(value) -> str:
     return "—" if value is None else str(value)
 
 
+def _chat_tz(event_id: int) -> str:
+    """Пояс чата, куда мероприятие добавлено в боте; иначе московский."""
+    try:
+        import sqlite3
+        con = sqlite3.connect(config.DB_PATH)
+        row = con.execute(
+            "SELECT c.tz FROM chat_events e JOIN chats c ON c.chat_id = e.chat_id "
+            "WHERE e.event_id = ? AND c.tz IS NOT NULL LIMIT 1",
+            (int(event_id),),
+        ).fetchone()
+        con.close()
+        if row and row[0]:
+            return row[0]
+    except Exception:
+        pass
+    return DEFAULT_TZ
+
+
 def _skip_reason(show: dict) -> str:
-    """Почему бот пропускает сеанс (пусто — не пропускает)."""
-    if show.get("is_active") in (0, False, "0"):
-        return "выключен (is_active)"
+    """Почему бот пропускает сеанс (пусто — не пропускает).
+
+    Выключенный сеанс бот НЕ пропускает: билеты на него считаются. Он лишь
+    не упоминается в чате, если билетов на него нет.
+    """
     if show.get("deleted_at"):
         return "удалён (deleted_at)"
     return ""
@@ -47,7 +68,7 @@ async def main() -> None:
         raise SystemExit(1)
 
     event_id = int(sys.argv[1])
-    tz_name = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_TZ
+    tz_name = sys.argv[2] if len(sys.argv) > 2 else _chat_tz(event_id)
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
@@ -93,13 +114,22 @@ async def main() -> None:
         rows.append((local, s))
     rows.sort(key=lambda r: (r[0] is None, r[0]))
 
-    counted = []
-    print("Сеансы (последние 60 по дате):")
-    for local, s in rows[-60:]:
+    # Сегодняшние сеансы собираем по ВСЕМУ списку, а печатаем только
+    # окрестность сегодняшнего дня: за 3 дня до и 3 дня после.
+    counted = [
+        int(s["id"]) for local, s in rows
+        if local is not None and local.date() == today and not _skip_reason(s)
+    ]
+    near = [
+        (local, s) for local, s in rows
+        if local is not None and abs((local.date() - today).days) <= 3
+    ]
+    print(f"Сеансы с {today - timedelta(days=3)} по {today + timedelta(days=3)}:")
+    if not near:
+        print("  в эти дни сеансов нет")
+    for local, s in near:
         skip = _skip_reason(s)
-        is_today = local is not None and local.date() == today and not skip
-        if is_today:
-            counted.append(int(s["id"]))
+        is_today = local.date() == today and not skip
 
         local_text = f"{local:%Y-%m-%d %H:%M}" if local else "дата не разобрана"
         line = (
@@ -113,6 +143,8 @@ async def main() -> None:
             line += f"  deleted_at={s.get('deleted_at')}"
         if skip:
             line += f"  [бот пропускает: {skip}]"
+        if s.get("is_active") in (0, False, "0") and not skip:
+            line += "  [выключен: билеты считаются, без билетов в чате не упоминается]"
         if is_today:
             line += "   <<< СЧИТАЕТСЯ СЕГОДНЯШНИМ"
         print(line)

@@ -222,6 +222,9 @@ def _tzinfo(tz_name: str | None) -> ZoneInfo:
         return ZoneInfo(config.DEFAULT_TZ)
 
 
+NO_SHOWS_TODAY = "Сегодня сеансов нет."
+
+
 async def event_report_block(
     qt: QTicketsClient, event_id: int, tz_name: str | None
 ) -> tuple[str, str]:
@@ -241,15 +244,27 @@ async def event_report_block(
             start = start.replace(tzinfo=tz)
         local = start.astimezone(tz)
         if local.date() == today:
-            todays.append({"id": s["id"], "local": local})
+            todays.append(
+                {"id": s["id"], "local": local, "active": s.get("active", True)}
+            )
 
     if not todays:
-        return info["name"], "Сегодня сеансов нет."
+        return info["name"], NO_SHOWS_TODAY
 
-    counts = await qt.count_tickets(event_id, {t["id"] for t in todays})
+    counts, fallback = await qt.count_tickets(event_id, {t["id"] for t in todays})
+    note = (
+        "\n⚠️ Посчитано по оплаченным заказам: QTickets не отдал список билетов. "
+        "Билеты по промокодам могли не попасть в счёт."
+        if fallback else ""
+    )
     total = sum(counts.values())
     if total == 0:
-        return info["name"], "На сегодня куплено билетов: 0"
+        # Билетов нет ни на один сеанс. Если сегодня есть хотя бы один
+        # действующий сеанс — продаж просто нет. Если все сегодняшние сеансы
+        # выключены — показа, по сути, нет, и о выключенных сеансах молчим.
+        if any(t["active"] for t in todays):
+            return info["name"], "На сегодня куплено билетов: 0" + note
+        return info["name"], NO_SHOWS_TODAY + note
 
     # В отчёт попадают только сеансы, на которые уже есть зрители;
     # сеансы с нулём не показываем.
@@ -259,7 +274,7 @@ async def event_report_block(
         n = counts.get(t["id"], 0)
         if n > 0:
             lines.append(f"{t['local'].strftime('%H:%M')} — {n}")
-    return info["name"], "\n".join(lines)
+    return info["name"], "\n".join(lines) + note
 
 
 async def build_report(
@@ -267,18 +282,16 @@ async def build_report(
     chat_row,
     events: list,
     only_event_ids: set[int] | None = None,
-) -> str:
+    quiet_if_empty: bool = False,
+) -> str | None:
     """Готовый текст отчёта по чату (все мероприятия или только указанные).
 
     Перед строками с билетами всегда ставится название мероприятия
     (жирным). Ошибка по одному мероприятию не ломает отчёт по остальным.
 
-    Сообщение начинается с пустой строки. Это не опечатка: в push-уведомлении
-    группового чата Телеграм сам подставляет «Имя бота: » перед текстом
-    сообщения. Без пустой строки эта подпись прилипает к первому слову
-    названия спектакля и ломает перенос («PROCESS Билеты: Леопарды» /
-    «Килиманджаро»). Пустая строка отделяет подпись от названия, и оно
-    начинается с новой строки в уведомлении.
+    Пустой строки в начале сообщения нет намеренно: Телеграм сам убирает
+    пробелы и переносы в начале текста, так что она ни на что не влияла.
+    Некрасивый перенос в push решён коротким именем бота.
     """
     if not events:
         return (
@@ -296,6 +309,11 @@ async def build_report(
 
     # Название мероприятия жирным ставим всегда — и когда оно одно, и когда
     # в одном сообщении собрано несколько.
+    #
+    # Спектакль, у которого сегодня нет сеансов, в сообщение НЕ попадает:
+    # «Леопарды» и «Эрнест» идут в разные дни, и строка «Сегодня сеансов нет»
+    # про второй спектакль — лишняя. Ошибки при этом показываются всегда:
+    # о сбое лучше знать, чем не знать.
     parts = []
     for ev in chosen:
         try:
@@ -312,11 +330,32 @@ async def build_report(
             name = ev["name"] or f"Мероприятие {ev['event_id']}"
             block = "⚠️ Внутренняя ошибка при сборке отчёта. Подробности в журнале бота."
 
+        if block == NO_SHOWS_TODAY:
+            continue
         title = display_name(str(name))
-        lead = "\n" if not parts else ""  # см. пояснение ниже
-        parts.append(f"{lead}<b>{html.escape(title)}</b>\n{html.escape(block)}")
+        parts.append(f"<b>{html.escape(title)}</b>\n{html.escape(block)}")
 
-    result = "\n\n".join(parts)
-    if len(result) > 4000:  # предел Телеграма на одно сообщение — 4096 знаков
-        result = result[:3990] + "\n…"
-    return result
+    if not parts:
+        # Сегодня нет сеансов ни у одного спектакля. По расписанию в такой день
+        # бот молчит; по кнопке отвечает одной строкой, чтобы нажатие не
+        # осталось без ответа.
+        return None if quiet_if_empty else NO_SHOWS_TODAY
+
+    # Предел Телеграма — 4096 знаков на сообщение. Обрезать текст посреди
+    # нельзя: разорвётся строка (время без числа) или разметка жирного
+    # шрифта, и Телеграм откажется отправлять сообщение. Поэтому берём
+    # целые блоки мероприятий, пока они влезают, а об остальных пишем честно.
+    limit = 3900
+    kept, length = [], 0
+    for i, part in enumerate(parts):
+        extra = len(part) + (2 if kept else 0)
+        if kept and length + extra > limit:
+            rest = len(parts) - i
+            kept.append(
+                f"…и ещё мероприятий: {rest}. Уведомления по расписанию "
+                "приходят по каждому спектаклю отдельно."
+            )
+            break
+        kept.append(part)
+        length += extra
+    return "\n\n".join(kept)

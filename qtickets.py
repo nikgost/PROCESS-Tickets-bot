@@ -98,9 +98,10 @@ class QTicketsClient:
                             raise QTicketsError(
                                 "QTickets: такой записи нет (ошибка 404) — проверьте ID."
                             )
-                        if 500 <= resp.status < 600:
+                        if resp.status == 429 or 500 <= resp.status < 600:
                             last_error = QTicketsError(
-                                f"QTickets временно недоступен (ошибка {resp.status})."
+                                f"QTickets временно недоступен или перегружен "
+                                f"(ошибка {resp.status})."
                             )
                             await asyncio.sleep(2 * (attempt + 1))
                             continue
@@ -161,11 +162,14 @@ class QTicketsClient:
             start = _parse_dt(s.get("start_date"))
             if s.get("id") is None or start is None:
                 continue
-            if s.get("is_active") in (0, False, "0"):
-                continue  # выключенные (отменённые) сеансы не считаем
             if s.get("deleted_at"):
-                continue  # удалённые сеансы тоже не считаем
-            shows.append({"id": int(s["id"]), "start": start})
+                continue  # удалённые сеансы не считаем никогда
+            # Выключенный сеанс НЕ отбрасываем: в QTickets «выключен» часто
+            # значит лишь «продажи закрыты», а зрители с билетами (например,
+            # по промокодам) на него всё равно придут. Что показывать в чате,
+            # решает отчёт: выключенный сеанс без билетов там не упоминается.
+            active = s.get("is_active") not in (0, False, "0")
+            shows.append({"id": int(s["id"]), "start": start, "active": active})
         return {
             "id": int(data["id"]),
             "name": _event_name(data.get("name"), event_id),
@@ -186,8 +190,10 @@ class QTicketsClient:
         counts: dict[int, int] = {}
         for sid in sorted(int(x) for x in show_ids):
             resp = await self._request("GET", f"shows/{sid}/barcodes")
+            paging = {}
             if isinstance(resp, dict) and isinstance(resp.get("data"), list):
                 items = resp["data"]
+                paging = resp.get("paging") or {}
             elif isinstance(resp, list):
                 items = resp
             else:
@@ -196,29 +202,41 @@ class QTicketsClient:
             for it in items:
                 if not isinstance(it, dict):
                     continue
-                key = it.get("id") or it.get("barcode")
+                key = it.get("id")
+                if key is None:
+                    key = it.get("barcode")
                 if key is None or key in seen:
                     continue
                 seen.add(key)
-            counts[sid] = len(seen)
+            n = len(seen)
+            # Если QTickets когда-нибудь начнёт отдавать билеты по страницам,
+            # в ответе будет общее число — берём его, а не длину первой страницы.
+            try:
+                total = int(paging.get("total") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            counts[sid] = max(n, total)
         return counts
 
-    async def count_tickets(self, event_id: int, show_ids: set[int]) -> dict[int, int]:
-        """Главный подсчёт для отчёта.
+    async def count_tickets(
+        self, event_id: int, show_ids: set[int]
+    ) -> tuple[dict[int, int], bool]:
+        """Главный подсчёт для отчёта. Возвращает (числа по сеансам, запасной_способ).
 
         Основной способ — по билетам сеанса (как в кабинете). Если QTickets
         по какой-то причине не отдал их, считаем прежним способом — по
-        оплаченным заказам — и пишем об этом в журнал: отчёт всё равно уйдёт.
+        оплаченным заказам. Отчёт всё равно уйдёт, но с пометкой: билеты по
+        промокодам при этом могли не попасть в счёт, и молчать об этом нельзя.
         """
         if not show_ids:
-            return {}
+            return {}, False
         try:
-            return await self.count_show_tickets(show_ids)
+            return await self.count_show_tickets(show_ids), False
         except QTicketsError as e:
             log.warning(
                 "Не удалось получить билеты по сеансам (%s) — считаю по заказам.", e
             )
-            return await self.count_paid_tickets(event_id, show_ids)
+            return await self.count_paid_tickets(event_id, show_ids), True
 
     async def count_paid_tickets(
         self, event_id: int, show_ids: set[int]

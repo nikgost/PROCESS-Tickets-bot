@@ -91,6 +91,7 @@ async def _tick(bot: Bot) -> None:
                     chat,
                     events,
                     only_event_ids={ev["event_id"]},
+                    quiet_if_empty=True,
                 )
             except Exception:
                 log.exception("Сбой сборки отчёта для чата %s", chat_id)
@@ -98,6 +99,16 @@ async def _tick(bot: Bot) -> None:
                     "⚠️ Не получилось собрать отчёт о билетах. "
                     "Подробности в журнале бота."
                 )
+
+            if text is None:
+                # У спектакля сегодня нет сеансов — ничего не отправляем, но
+                # отмечаем как обработанное, чтобы не спрашивать QTickets снова.
+                db.sent_add(chat_id, ev["event_id"], local_date, hhmm)
+                log.info(
+                    "Чат %s, мероприятие %s: сегодня сеансов нет — отчёт не отправлен",
+                    chat_id, ev["event_id"],
+                )
+                continue
 
             try:
                 await bot.send_message(chat_id, text)
